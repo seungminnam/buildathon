@@ -170,12 +170,39 @@ def tpc_check(cid, keep, changes, ms, deadline):
     return keep - drop, f" digest {suites} cpu {children_cpu() - c0:.2f}s dropped {len(drop)}"
 
 
+def import_breakage(got, analyzer, local_to_number):
+    """Tests hit by modules that fail to import, or None when that is everyone.
+
+    A leaf module (one dialect's parser, a generator) that stops importing
+    breaks the tests that use it. If sqlglot itself or the test package no
+    longer imports, everything fails.
+    """
+    out = set()
+    for mod, _msg in got["errors"]:
+        if mod in ("sqlglot", "tests", "<probe>") or mod.count(".") < 1:
+            return None
+        base = os.path.join(SQLGLOT, *mod.split("."))
+        if os.path.isfile(base + ".py"):
+            path = mod.replace(".", "/") + ".py"
+        elif os.path.isfile(os.path.join(base, "__init__.py")):
+            path = mod.replace(".", "/") + "/__init__.py"
+        else:
+            return None
+        if path.startswith("tests/"):
+            local = analyzer.cov.by_file.get(path, set())
+        else:
+            local = analyzer.module_users(path)
+        out |= {local_to_number[i] for i in local if local_to_number[i] is not None}
+    return out
+
+
 def merge(res, part):
     res.tests |= part.tests
     res.notes += part.notes
     res.fallback = res.fallback or part.fallback
     res.if_import_changed |= part.if_import_changed
     res.allowed += part.allowed
+    res.import_paths |= part.import_paths
 
 
 def children_cpu():
@@ -275,7 +302,12 @@ def main():
                 if got and not got["errors"] and base_fp:
                     new_fp = {k: v for k, v in got["fp"].items() if k not in base_noise}
                     changed = [k for k in probe.diff(base_fp, new_fp) if not any(k.startswith(a) for a in allowed)]
-                if changed is None or changed:
+                broken = import_breakage(got, analyzer, local_to_number) if got and got["errors"] else None
+                if broken is not None:
+                    # some modules no longer import: what fails is what uses them
+                    chosen = chosen | broken
+                    notes = notes + [f"import breaks {len(got['errors'])} modules: {len(broken)} tests"]
+                elif changed is None or changed:
                     chosen = chosen | extra
                     notes = notes + [f"import changed: {(changed or ['error'])[:3]}"]
                 else:

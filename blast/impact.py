@@ -46,6 +46,7 @@ class Result:
         # fingerprint key patterns the edit is expected to change.
         self.if_import_changed = set()
         self.allowed = []
+        self.import_paths = set()
 
     def add(self, tests, note):
         self.tests |= set(tests)
@@ -278,7 +279,22 @@ class Analyzer:
         opened = self.cov.opened(path)
         if opened:
             return opened
-        return set(self.cov.all)  # imported while collecting: everyone has it
+        # imported while collecting: everyone has it, which is only true if
+        # the change alters the import itself; the probe decides that
+        self.import_sensitive.add(path)
+        return self.module_users(path)
+
+    def module_users(self, path):
+        """Tests that ran code of the module, opened it, or built one of its classes."""
+        out = set()
+        for s in set(self.cov.lines(path).values()):
+            out.update(self.cov.sets[s])
+        out |= self.cov.opened(path)
+        prefix = module_name(path) + "."
+        for qual, s in self.cov.classes.items():
+            if qual.startswith(prefix):
+                out.update(self.cov.sets[s])
+        return out
 
     def test_module_tests(self, path):
         out = set(self.cov.by_file.get(path, set()))
@@ -310,6 +326,16 @@ class Analyzer:
     # --- per file -----------------------------------------------------------------------
 
     def analyze(self, fd, res):
+        self.import_sensitive = set()
+        self._analyze(fd, res)
+        if self.import_sensitive:
+            # module_tests() narrowed "everyone imports it" to the module's
+            # users; the selector widens back unless the import probe shows
+            # the patched modules import cleanly and build the same state
+            res.if_import_changed |= self.cov.all
+            res.import_paths |= self.import_sensitive
+
+    def _analyze(self, fd, res):
         old_path, new_path = fd.old_path, fd.new_path
         path = new_path or old_path
         if fd.binary:
@@ -369,6 +395,130 @@ class Analyzer:
             self.one_change(path, src, new_src, ch, res)
 
     def one_change(self, path, src, new_src, ch, res):
+        if ch.kind == "mod" and self.dict_entry_change(path, src, new_src, ch, res):
+            return
+        self._one_change(path, src, new_src, ch, res)
+
+    # --- one entry of a class-level table -------------------------------------------------
+
+    # tables keyed by SQL text (function names, keywords, format tokens): a
+    # test can only reach an entry by writing its key somewhere
+    _TEXT_TABLES = re.compile(r"^(FUNCTIONS|NO_PAREN_FUNCTIONS|KEYWORDS|[A-Z_]*_PARSERS|[A-Z_]*_MAPPING)$")
+
+    @staticmethod
+    def _entry_key(src, line):
+        """Key node of the class-level dict entry on `line`, or None.
+
+        Only entries that sit on one line and belong to a dict that is the
+        value of a class-body assignment qualify."""
+        col = src.first_col(line)
+        chain = src.chain_at(line, col)
+        for i, node in enumerate(chain):
+            if isinstance(node, FUNC_NODES):
+                break
+            if isinstance(node, ast.Dict) and i + 1 < len(chain):
+                child = chain[i + 1]
+                for k, v in zip(node.keys, node.values):
+                    if k is None:
+                        continue
+                    if child is k or child is v:
+                        first = k.lineno
+                        last = v.end_lineno
+                        owner = [n for n in chain[:i] if isinstance(n, (ast.Assign, ast.AnnAssign))]
+                        if first == line == last and owner and any(isinstance(n, ast.ClassDef) for n in chain[:i]):
+                            tgt = owner[-1].targets[0] if isinstance(owner[-1], ast.Assign) else owner[-1].target
+                            k.table = tgt.id if isinstance(tgt, ast.Name) else ""
+                            return k
+                        return None
+        return None
+
+    def _key_tests(self, key):
+        """Tests that could reach entry `key`; None when we cannot tell."""
+        if isinstance(key, ast.Attribute) and isinstance(key.value, ast.Name) and key.value.id == "exp":
+            name = key.attr
+            out, found = set(), False
+            for qual, s in self.cov.classes.items():
+                if qual.startswith("sqlglot.expressions.") and qual.rsplit(".", 1)[-1] == name:
+                    out.update(self.cov.sets[s])
+                    found = True
+            return out if found else set()
+        if (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and len(key.value.strip()) >= 2
+            and self._TEXT_TABLES.match(getattr(key, "table", ""))
+        ):
+            return self.tests_mentioning(key.value)
+        return None
+
+    def tests_mentioning(self, text):
+        """Tests whose test class source, or a fixture they opened, contains `text`
+        (case-insensitive)."""
+        needle = text.lower()
+        out = set()
+        for path in self.py_files():
+            if not path.startswith("tests/"):
+                continue
+            t = self.text(path) or ""
+            if needle not in t.lower():
+                continue
+            src = self.source(path)
+            if src is None:
+                out |= self.cov.by_file.get(path, set())
+                continue
+            hit_module_level = False
+            for node in src.tree.body:
+                seg = "\n".join(src.lines[node.lineno - 1:node.end_lineno]).lower()
+                if needle not in seg:
+                    continue
+                if isinstance(node, ast.ClassDef):
+                    for i, tid in enumerate(self.cov.tests):
+                        if tid.startswith(f"{path}::{node.name}::"):
+                            out.add(i)
+                else:
+                    hit_module_level = True
+            if hit_module_level:
+                # a helper or constant: every test of the file, and of files using it
+                out |= self.test_module_tests(path)
+        for fpath, s in self.cov.opens.items():
+            if fpath.startswith("dir:") or fpath.endswith(".py"):
+                continue
+            t = self.text(fpath)
+            if t and needle in t.lower():
+                out.update(self.cov.sets[s])
+        return out
+
+    def dict_entry_change(self, path, src, new_src, ch, res):
+        """A one-line edit of one entry of a class-level table (FUNCTIONS,
+        KEYWORDS, TRANSFORMS...). Narrow the usual class-users answer to the
+        tests that can reach that entry: for an expression-class key, the
+        tests that built that expression; for a string key, the tests whose
+        source or fixtures mention it. Returns False when it does not apply."""
+        if not ch.new_lines:
+            return False
+        k_old = self._entry_key(src, ch.old_line)
+        k_new = self._entry_key(new_src, ch.new_lines[0])
+        if k_old is None or k_new is None:
+            return False
+        reach = set()
+        for k in (k_old, k_new):
+            t = self._key_tests(k)
+            if t is None:
+                return False
+            reach |= t
+        part = Result()
+        self._one_change(path, src, new_src, ch, part)
+        if part.fallback:
+            return False
+        key_txt = ast.unparse(k_old)
+        res.tests |= part.tests & reach
+        res.notes.append(f"entry {key_txt}: {len(part.tests & reach)} of {len(part.tests)}")
+        res.if_import_changed |= part.if_import_changed
+        res.allowed += part.allowed
+        res.import_paths |= part.import_paths
+        return True
+
+    def _one_change(self, path, src, new_src, ch, res):
         positions = []
         if ch.kind == "mod":
             a, b = ch.old_text, ch.new_text
