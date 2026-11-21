@@ -19,7 +19,7 @@ from blast.covmap import CoverageMap  # noqa: E402
 from blast.impact import Analyzer, Result  # noqa: E402
 from blast.pack import cost as pack_cost  # noqa: E402
 from blast.pack import pack  # noqa: E402
-from blast import overlay, probe, verify  # noqa: E402
+from blast import overlay, probe, tpcdigest, verify  # noqa: E402
 
 DATA = Path(os.environ.get("BLAST_DATA", "/data"))
 SQLGLOT = os.environ.get("BLAST_SQLGLOT", "/opt/sqlglot")
@@ -132,6 +132,42 @@ def check(cid, chosen, changes, ms, deadline, notes=()):
 
 NODEID = {}
 VOUCHABLE = {}
+TPC = {}  # test number -> suite, for the tests blast/tpcdigest.py stands in for
+TPC_BASE = None
+TPC_MAP = os.environ.get("BLAST_TPC_MAP", str(HERE / "maps" / "tpc_digest.json"))
+
+
+def tpc_applicable(changes):
+    """The digest covers what sqlglot computes, not how the executor runs it."""
+    for path in changes:
+        if path.startswith("sqlglot/executor/") or path in ("tests/test_executor.py", "tests/helpers.py"):
+            return False
+        if "/tpc-" in path and not path.endswith(".sql"):
+            return False
+        if not (path.startswith("sqlglot/") or path.startswith("tests/")):
+            return False
+    return True
+
+
+def tpc_check(cid, keep, changes, ms, deadline):
+    global TPC_BASE
+    tpc = keep & set(TPC)
+    if not tpc_applicable(changes):
+        return keep, " digest n/a"
+    if TPC_BASE is None:
+        TPC_BASE = json.load(open(TPC_MAP))
+    saving = pack_cost(pack(sorted(keep), ms), ms) - pack_cost(pack(sorted(keep - tpc), ms), ms)
+    suites = sorted({TPC[n] for n in tpc})
+    estimate = 1500 + (5000 if "tpcds" in suites else 0)
+    left = deadline - time.monotonic()
+    if saving <= estimate or left < 15:
+        return keep, ""
+    tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes)
+    c0 = children_cpu()
+    same = tpcdigest.run(tree, timeout=min(60, left - 5), base=TPC_BASE, suites=tuple(suites)) or {}
+    overlay.remove(tree)
+    drop = {n for n in tpc if same.get(NODEID[n]) is True}
+    return keep - drop, f" digest {suites} cpu {children_cpu() - c0:.2f}s dropped {len(drop)}"
 
 
 def merge(res, part):
@@ -155,6 +191,10 @@ def main():
     number = {t["id"]: t["number"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     NODEID.update({t["number"]: t["id"] for t in tests})
+    for suite, nodes in tpcdigest.TESTS.items():
+        for node in nodes:
+            if node in number:
+                TPC[number[node]] = suite
     cov = CoverageMap(MAP)
     local_to_number = [number.get(tid) for tid in cov.tests]
     unmapped = sorted(set(number.values()) - {n for n in local_to_number if n is not None})
@@ -164,7 +204,7 @@ def main():
     log(f"loaded in {time.process_time() - t0:.2f}s cpu")
 
     paths = sorted((DATA / "commits").glob("*.patch"))
-    deadline = time.monotonic() + min(160.0, 3.5 * max(len(paths), 1))
+    deadline = time.monotonic() + min(165.0, 30 + 3.5 * len(paths))
     plans = []
     pending_probe = {}
     for path in paths:
@@ -250,6 +290,12 @@ def main():
             except Exception as e:  # a failed check keeps every candidate
                 log(f"{cid}: check failed ({type(e).__name__}: {e})")
                 keep, how = chosen, "check-error"
+        if VERIFY and changes is not None and keep & set(TPC):
+            try:
+                keep, more = tpc_check(cid, keep, changes, ms, deadline)
+                how += more
+            except Exception as e:  # unsure: keep them
+                how += f" digest failed {type(e).__name__}"
         workers = pack(sorted(keep), ms)
         log(
             f"{cid}: {len(chosen)} candidates, {how}, {len(keep)} kept, {len(workers)} workers,"

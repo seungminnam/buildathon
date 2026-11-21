@@ -18,7 +18,13 @@ tarfile.open(fileobj=io.BytesIO(urllib.request.urlopen(url).read())).extractall(
 COPY selector.py /app/selector.py
 COPY blast /app/blast
 COPY maps /app/maps
-RUN python -m compileall -q /app && chmod -R a+rX /app
+# Fixed string hashing: the TPC digest below must come out the same at
+# build time and at run time.
+ENV PYTHONHASHSEED=0 SKIP_INTEGRATION=0
+# Record of what the pinned tree computes for every TPC-H/TPC-DS query
+# (blast/tpcdigest.py). Built here so the run does not pay for it.
+RUN cd /app && python -m blast.tpcdigest /opt/sqlglot /app/maps/tpc_digest.json \
+ && python -m compileall -q /app && chmod -R a+rX /app
 
-ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0
+ENV PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]
