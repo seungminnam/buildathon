@@ -34,6 +34,8 @@ VERIFY = os.environ.get("BLAST_VERIFY", "1") == "1"
 RUN_MAX_MS = int(os.environ.get("BLAST_RUN_MAX_MS", "1500"))
 OVERHEAD_MS = int(os.environ.get("BLAST_OVERHEAD_MS", "700"))
 CPU_RATIO = float(os.environ.get("BLAST_CPU_RATIO", "1.3"))
+PROXY = os.environ.get("BLAST_PROXY", "1") == "1"
+PROXY_MIN = int(os.environ.get("BLAST_PROXY_MIN", "3"))
 
 
 def log(*args):
@@ -86,13 +88,20 @@ def pass_chance(notes):
 
 
 def check(cid, chosen, changes, ms, deadline, notes=()):
-    """Run the cheap candidates against the patched tree; keep what fails."""
+    """Run the cheap candidates against the patched tree; keep what fails.
+
+    With PROXY on, the cheap candidates also speak for the expensive ones:
+    they ran the same changed code, so when none of them fails we drop the
+    expensive tests as well. When any cheap one fails, every expensive
+    candidate stays.
+    """
     cheap = {n for n in chosen if ms[n] <= RUN_MAX_MS}
     dear = chosen - cheap
     if not cheap:
         return chosen, "listed"
+    proxy = PROXY and bool(dear) and len(cheap) >= PROXY_MIN
     listed = pack_cost(pack(sorted(chosen), ms), ms)
-    after = pack_cost(pack(sorted(dear), ms), ms)
+    after = 0 if proxy else pack_cost(pack(sorted(dear), ms), ms)
     run_cost = OVERHEAD_MS + CPU_RATIO * sum(ms[n] for n in cheap)
     gain = pass_chance(notes) * (listed - after)
     left = deadline - time.monotonic()
@@ -100,18 +109,24 @@ def check(cid, chosen, changes, ms, deadline, notes=()):
         return chosen, "listed"
     tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes)
     ids = sorted(NODEID[n] for n in cheap)
-    timeout = min(left - 2, 20 + 4 * sum(ms[n] for n in cheap) / 1000)
-    t = time.monotonic()
+    # a run far past its expected CPU is a hang or a slow failure; stop it
+    # and list everything rather than pay for it
+    timeout = min(left - 2, 5 + 3 * run_cost / 1000)
     c0 = children_cpu()
-    failed, done, broken, ok = verify.run(tree, ids, timeout)
+    failed, done, broken, ok = verify.run(tree, ids, timeout, stop_on_fail=bool(dear))
     cpu = children_cpu() - c0
     overlay.remove(tree)
-    keep = set(dear)
+    bad = set()
     for n in cheap:
         tid = NODEID[n]
         if tid in failed or tid not in done or tid.split("::")[0] in broken:
-            keep.add(n)
-    return keep, f"checked {len(cheap)} ({sum(ms[n] for n in cheap) / 1000:.2f}s rec) cpu {cpu:.2f}s ok={ok} failed={len(keep - dear)}"
+            bad.add(n)
+    info = f"checked {len(cheap)} ({sum(ms[n] for n in cheap) / 1000:.2f}s rec) cpu {cpu:.2f}s ok={ok} failed={len(bad)}"
+    if not ok:
+        return chosen, info + " incomplete"
+    if proxy and not bad:
+        return set(), info + f" dropped {len(dear)} long"
+    return dear | bad, info
 
 
 NODEID = {}

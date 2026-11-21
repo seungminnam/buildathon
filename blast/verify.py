@@ -76,11 +76,22 @@ def warm_up():
             pass
 
 
-def run(tree, nodeids, timeout):
+def _kill(pid):
+    """Kill the child and the pool workers it forked."""
+    for target in (lambda: os.killpg(pid, signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
+        try:
+            target()
+        except OSError:
+            pass
+
+
+def run(tree, nodeids, timeout, stop_on_fail=False):
     """Returns (failed nodeids, finished nodeids, files that failed to collect, ok).
 
     ok is False when the child did not exit cleanly (killed on the deadline or
-    crashed); callers treat any test without a D line as unverified.
+    crashed); callers treat any test without a D line as unverified. With
+    stop_on_fail the child is stopped at the first failure; ok stays True
+    and the tests that did not get to run have no D line.
     """
     failed, done, broken = set(), set(), set()
     if not nodeids:
@@ -90,6 +101,7 @@ def run(tree, nodeids, timeout):
     if pid == 0:
         try:
             os.close(r)
+            os.setpgid(0, 0)
             os.dup2(NULL, 0)
             if not os.environ.get("BR_DEBUG"):
                 os.dup2(NULL, 1)
@@ -124,11 +136,11 @@ def run(tree, nodeids, timeout):
     os.close(w)
     buf = b""
     deadline = time.monotonic() + timeout
-    killed = False
+    killed = stopped = False
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
-            os.kill(pid, signal.SIGKILL)
+            _kill(pid)
             killed = True
             break
         ready, _, _ = select.select([r], [], [], left)
@@ -138,8 +150,13 @@ def run(tree, nodeids, timeout):
         if not chunk:
             break
         buf += chunk
+        if stop_on_fail and (b"\nF " in b"\n" + buf or b"\nC " in b"\n" + buf):
+            _kill(pid)
+            stopped = True
+            break
     os.close(r)
     _, status = os.waitpid(pid, 0)
+    buf = buf[: buf.rfind(b"\n") + 1]
     for line in buf.decode("utf-8", "replace").splitlines():
         tag, _, rest = line.partition(" ")
         if tag == "F":
@@ -148,5 +165,7 @@ def run(tree, nodeids, timeout):
             done.add(rest)
         elif tag == "C":
             broken.add(rest)
+    if stopped:
+        return failed, done - failed, broken, True
     ok = not killed and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     return failed, done, broken, ok
