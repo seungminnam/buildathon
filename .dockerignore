@@ -1,0 +1,7 @@
+# The image needs only the selector, its package and the map.
+*
+!selector.py
+!blast/
+!maps/
+!requirements.lock
+**/__pycache__

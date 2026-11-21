@@ -1,0 +1,7 @@
+Download → https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md
+dev-answer.zip → https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip
+generator.zip → https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+rules.md → https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1
+starter-duckdb.zip → https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip
+starter-polars.zip → https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-polars.zip
+starter-pyspark.zip → https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-pyspark.zip
