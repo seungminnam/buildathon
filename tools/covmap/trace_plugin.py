@@ -57,6 +57,15 @@ def _on_line(code, line, _optimized=CO_OPTIMIZED, _disable=mon.DISABLE):
     return _disable
 
 
+def _on_start(code, offset, _disable=mon.DISABLE):
+    # a lambda whose body is one constant raises no LINE event: count the call
+    if code.co_name == "<lambda>":
+        rel = _rel(code.co_filename)
+        if rel:
+            _lines.add((rel, code.co_firstlineno))
+    return _disable
+
+
 def _audit(event, args):
     if event == "open" and args and isinstance(args[0], str):
         rel = _rel(args[0])
@@ -108,7 +117,8 @@ def pytest_configure(config):
     _out = open(OUT, "w")
     mon.use_tool_id(TOOL, "covmap")
     mon.register_callback(TOOL, mon.events.LINE, _on_line)
-    mon.set_events(TOOL, mon.events.LINE)
+    mon.register_callback(TOOL, mon.events.PY_START, _on_start)
+    mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
     sys.addaudithook(_audit)
     from sqlglot.dialects.dialect import Dialect
     from sqlglot.generator import Generator
@@ -193,6 +203,7 @@ def pytest_runtest_makereport(item, call):
 def pytest_unconfigure(config):
     mon.set_events(TOOL, 0)
     mon.register_callback(TOOL, mon.events.LINE, None)
+    mon.register_callback(TOOL, mon.events.PY_START, None)
     mon.free_tool_id(TOOL)
     if _out:
         _flush("<end>", "end", 0.0)

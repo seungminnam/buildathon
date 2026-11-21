@@ -32,6 +32,13 @@ if _dir:
                 _write(_fd, f"L\t{r}\t{line}\n".encode())
         return _disable
 
+    def _on_start(code, offset, _disable=_mon.DISABLE, _write=os.write):
+        if code.co_name == "<lambda>":
+            r = _path(code.co_filename)
+            if r:
+                _write(_fd, f"L\t{r}\t{code.co_firstlineno}\n".encode())
+        return _disable
+
     def _audit(event, args, _write=os.write):
         if event == "open" and args and isinstance(args[0], str):
             r = _path(args[0])
@@ -40,5 +47,6 @@ if _dir:
 
     _mon.use_tool_id(_mon.COVERAGE_ID, "covmap-sub")
     _mon.register_callback(_mon.COVERAGE_ID, _mon.events.LINE, _on_line)
-    _mon.set_events(_mon.COVERAGE_ID, _mon.events.LINE)
+    _mon.register_callback(_mon.COVERAGE_ID, _mon.events.PY_START, _on_start)
+    _mon.set_events(_mon.COVERAGE_ID, _mon.events.LINE | _mon.events.PY_START)
     sys.addaudithook(_audit)

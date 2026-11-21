@@ -14,6 +14,9 @@ class CoverageMap:
         self.opens = raw["opens"]
         self.classes = raw["classes"]
         self.import_lines = {p: set(v) for p, v in raw["import_lines"].items()}
+        self._import_raw = raw.get("import_files", {})
+        self._import_files = {}
+        self.import_filesets = raw.get("import_filesets", [])
         self.all = frozenset(range(len(self.tests)))
         self.by_file = {}
         for i, tid in enumerate(self.tests):
@@ -36,6 +39,24 @@ class CoverageMap:
             if s is not None and s not in seen:
                 seen.add(s)
                 out.update(self.sets[s])
+        return out
+
+    def import_tests(self, path, lines):
+        """Tests in the files whose import runs any of `lines` of `path`."""
+        per = self._import_files.get(path)
+        if per is None:
+            flat = self._import_raw.get(path, [])
+            per = self._import_files[path] = dict(zip(flat[0::2], flat[1::2]))
+        files = set()
+        for ln in lines:
+            fs = per.get(ln)
+            if fs is not None:
+                files.update(self.import_filesets[fs])
+        if "*" in files:
+            return set(self.all)
+        out = set()
+        for f in files:
+            out |= self.by_file.get(f, set())
         return out
 
     def covered(self, path, ln):

@@ -73,31 +73,46 @@ def strip_docstrings(tree):
     return tree
 
 
+def _is_docstring(st):
+    return isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
+
+
+def _same_body(xs, ys, old_lines, new_lines):
+    if xs and ys and _is_docstring(xs[0]) and _is_docstring(ys[0]):
+        xs, ys = xs[1:], ys[1:]
+    if len(xs) != len(ys):
+        return False
+    for x, y in zip(xs, ys):
+        if type(x) is not type(y):
+            return False
+        if old_lines[x.lineno - 1 : x.end_lineno] == new_lines[y.lineno - 1 : y.end_lineno]:
+            continue
+        if isinstance(x, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            # compare the header, then the body statement by statement
+            hx = copy.copy(x)
+            hy = copy.copy(y)
+            hx.body = hy.body = []
+            if ast.dump(hx) != ast.dump(hy):
+                return False
+            if not _same_body(x.body, y.body, old_lines, new_lines):
+                return False
+            continue
+        if ast.dump(x) != ast.dump(y):
+            return False
+    return True
+
+
 def same_behaviour(old, new, old_tree=None, new_tree=None):
     """True when two sources parse to the same tree, docstrings aside.
 
-    Only top-level statements that differ in text are dumped and compared,
-    which keeps this cheap on big modules."""
+    Statements whose text is unchanged are skipped and classes and functions
+    are compared statement by statement, which keeps this cheap on big modules."""
     try:
         a = old_tree or ast.parse(old)
         b = new_tree or ast.parse(new)
     except SyntaxError:
         return False
-    if len(a.body) != len(b.body):
-        return False
-    old_lines, new_lines = old.split("\n"), new.split("\n")
-    for x, y in zip(a.body, b.body):
-        if type(x) is not type(y):
-            return False
-        tx = old_lines[x.lineno - 1 : x.end_lineno]
-        ty = new_lines[y.lineno - 1 : y.end_lineno]
-        if tx == ty:
-            continue
-        dx = ast.dump(strip_docstrings(ast.Module(body=[copy.deepcopy(x)], type_ignores=[])))
-        dy = ast.dump(strip_docstrings(ast.Module(body=[copy.deepcopy(y)], type_ignores=[])))
-        if dx != dy:
-            return False
-    return True
+    return _same_body(a.body, b.body, old.split("\n"), new.split("\n"))
 
 
 class PySource:
@@ -174,6 +189,7 @@ class Analyzer:
         self._src = {}
         self._text = {}
         self._py_files = None
+        self._upper = {}
 
     # --- sources ------------------------------------------------------------------------
 
@@ -231,6 +247,90 @@ class Analyzer:
             self._src[key] = (func_lines, class_lines)
         return self._src[key]
 
+    def stmt_lines(self, path):
+        """{line: lines of the statement (or compound header) holding it}."""
+        key = ("stmts", path)
+        if key not in self._src:
+            out = {}
+            src = self.source(path)
+            if src is not None:
+                for node in ast.walk(src.tree):
+                    if not isinstance(node, ast.stmt) or isinstance(node, ast.ClassDef):
+                        continue
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    lines = frozenset(header_lines(node)) if body_lists(node) else frozenset(
+                        range(node.lineno, node.end_lineno + 1))
+                    for ln in lines:
+                        old = out.get(ln)
+                        if old is None or len(lines) < len(old):
+                            out[ln] = lines
+            self._src[key] = out
+        return self._src[key]
+
+    def sql_name_tests(self, cls_node):
+        """Tests whose SQL (test source or fixture files) names an expression class.
+
+        Functions are parsed by name through a registry built at import, so no
+        sqlglot line mentions the class; the SQL text in the tests does."""
+        names = {re.sub(r"(?<!^)(?=[A-Z])", "_", cls_node.name).upper()}
+        for st in cls_node.body:
+            if isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_sql_names" for t in st.targets):
+                for el in ast.walk(st.value):
+                    if isinstance(el, ast.Constant) and isinstance(el.value, str):
+                        names.add(el.value.upper())
+        pats = [re.compile(r"\b" + re.escape(n) + r"\b", re.IGNORECASE) for n in names if len(n) >= 3]
+        out = set()
+        for p in self.all_paths:
+            if not p.startswith("tests/"):
+                continue
+            is_py = p.endswith(".py")
+            if not is_py and not p.startswith("tests/fixtures/"):
+                continue
+            t = self.text(p)
+            if not t:
+                continue
+            low = self._upper.get(p)
+            if low is None:
+                low = self._upper[p] = t.upper()
+            if not any(n in low for n in names):
+                continue
+            if not is_py:
+                if any(pt.search(t) for pt in pats):
+                    out |= self.cov.opened(p)
+                continue
+            hits = [i + 1 for i, line in enumerate(t.split("\n")) if any(pt.search(line) for pt in pats)]
+            if hits:
+                out |= self.test_ids_at(p, hits)
+        return out
+
+    def test_ids_at(self, path, lines):
+        """Tests whose method holds any of `lines`; the whole file otherwise."""
+        key = ("testlines", path)
+        if key not in self._src:
+            local = {tid: i for i, tid in enumerate(self.cov.tests)}
+            at = {}
+            src = self.source(path)
+            if src is not None:
+                for cls in src.tree.body:
+                    if not isinstance(cls, ast.ClassDef):
+                        continue
+                    for fn in cls.body:
+                        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name.startswith("test"):
+                            i = local.get(f"{path}::{cls.name}::{fn.name}")
+                            if i is not None:
+                                for ln in range(fn.lineno, fn.end_lineno + 1):
+                                    at[ln] = i
+            self._src[key] = at
+        at = self._src[key]
+        out = set()
+        for ln in lines:
+            i = at.get(ln)
+            if i is None:
+                return set(self.cov.by_file.get(path, set()))
+            out.add(i)
+        return out
+
     def mentions(self, name, files=None):
         """(path, line) of every line mentioning identifier `name`."""
         pat = re.compile(r"\b" + re.escape(name) + r"\b")
@@ -257,6 +357,8 @@ class Analyzer:
         else:
             tests, _ = self.refs(cls.name)
             out |= tests
+            if path.startswith("sqlglot/expressions/"):
+                out |= self.sql_name_tests(cls)
         return out
 
     def refs(self, name, files=None):
@@ -271,10 +373,13 @@ class Analyzer:
             t = self.text(p)
             if not t or name not in t:
                 continue
-            hits = [i + 1 for i, line in enumerate(t.split("\n")) if pat.search(line)]
+            hits = [i + 1 for i, line in enumerate(t.split("\n")) if name in line and pat.search(line)]
             if not hits:
                 continue
+            # continuation lines carry their statement's tests (see build_map.py)
             tests |= self.cov.tests_for_lines(p, hits)
+            # code that runs while test files import: those files fail to import
+            tests |= self.cov.import_tests(p, hits)
             imp = self.cov.import_lines.get(p)
             if imp and any(h in imp for h in hits):
                 at_import = True
@@ -444,11 +549,14 @@ class Analyzer:
             if insertion and isinstance(stmt, ast.stmt):
                 lines.add(stmt.lineno)
         tests = self.cov.tests_for_lines(path, lines)
+        imp_tests = self.cov.import_tests(path, lines)
+        if imp_tests:
+            # the statement runs while test files import them
+            res.add(imp_tests, f"import-time {path}:{line}")
         imp = self.cov.import_lines.get(path)
-        fl = set(range(func.lineno, func.end_lineno + 1))
-        if imp and fl & imp:
-            # the function runs while modules import (decorators, registries)
-            res.add(self.module_tests(path), f"import-time function {path}:{line}")
+        if imp and lines & imp and not imp_tests:
+            # ran during collection but not seen per file: assume the module's users
+            res.add(self.module_tests(path), f"collection-time {path}:{line}")
         res.add(tests, f"stmt {path}:{line}")
 
     def definition_level(self, path, src, chain, line, res):
