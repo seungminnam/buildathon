@@ -45,7 +45,17 @@ def main():
     if DEFAULT_SQLGLOT:
         env["BLAST_SQLGLOT"] = DEFAULT_SQLGLOT
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    proc = subprocess.run([sys.executable, str(ROOT / "selector.py")], env=env, capture_output=True)
+    if os.environ.get("EVAL_DOCKER"):
+        # run inside the tooling image: tools/eval.py <set> with EVAL_DOCKER=<compiled sqlglot dir>
+        cmd = ["docker", "run", "--rm", "--network", "none", "--tmpfs", "/tmp:rw,size=64m",
+               "-v", f"{ROOT}:/app:ro", "-v", f"{set_dir.resolve()}:/data:ro",
+               "-v", f"{os.environ['EVAL_DOCKER']}:/opt/sqlglot:ro", "fw-env", "python", "/app/selector.py"]
+        proc = subprocess.run(cmd, capture_output=True)
+    else:
+        proc = subprocess.run([sys.executable, str(ROOT / "selector.py")], env=env, capture_output=True)
+    for line in proc.stderr.decode().splitlines():
+        if line.startswith("total "):
+            print(line)
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
     if proc.returncode:

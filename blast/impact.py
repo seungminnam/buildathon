@@ -18,6 +18,7 @@ using only the pinned checkout and the coverage map built from it:
 """
 
 import ast
+import copy
 import io
 import os
 import re
@@ -72,14 +73,31 @@ def strip_docstrings(tree):
     return tree
 
 
-def same_behaviour(old, new):
-    """True when two sources parse to the same tree, docstrings aside."""
+def same_behaviour(old, new, old_tree=None, new_tree=None):
+    """True when two sources parse to the same tree, docstrings aside.
+
+    Only top-level statements that differ in text are dumped and compared,
+    which keeps this cheap on big modules."""
     try:
-        a = ast.dump(strip_docstrings(ast.parse(old)))
-        b = ast.dump(strip_docstrings(ast.parse(new)))
+        a = old_tree or ast.parse(old)
+        b = new_tree or ast.parse(new)
     except SyntaxError:
         return False
-    return a == b
+    if len(a.body) != len(b.body):
+        return False
+    old_lines, new_lines = old.split("\n"), new.split("\n")
+    for x, y in zip(a.body, b.body):
+        if type(x) is not type(y):
+            return False
+        tx = old_lines[x.lineno - 1 : x.end_lineno]
+        ty = new_lines[y.lineno - 1 : y.end_lineno]
+        if tx == ty:
+            continue
+        dx = ast.dump(strip_docstrings(ast.Module(body=[copy.deepcopy(x)], type_ignores=[])))
+        dy = ast.dump(strip_docstrings(ast.Module(body=[copy.deepcopy(y)], type_ignores=[])))
+        if dx != dy:
+            return False
+    return True
 
 
 class PySource:
@@ -89,10 +107,6 @@ class PySource:
         self.text = text
         self.lines = text.split("\n")
         self.tree = ast.parse(text)
-        self.parent = {}
-        for node in ast.walk(self.tree):
-            for child in ast.iter_child_nodes(node):
-                self.parent[child] = node
 
     def chain_at(self, line, col):
         """Nodes from the module down to the deepest one holding (line, col)."""
@@ -348,9 +362,6 @@ class Analyzer:
         if new is None:
             res.add(self.module_tests(path), f"deleted {path}")
             return
-        if same_behaviour(old, new):
-            res.notes.append(f"no-op {path}")
-            return
         src = self.source(path)
         if src is None:
             res.everything(self.cov, f"unparsable {path}")
@@ -359,6 +370,9 @@ class Analyzer:
             new_src = PySource(new)
         except SyntaxError:
             res.add(self.module_tests(path), f"syntax error {path}")
+            return
+        if same_behaviour(old, new, src.tree, new_src.tree):
+            res.notes.append(f"no-op {path}")
             return
         for ch in patchlib.changes(fd):
             self.one_change(path, src, new_src, ch, res)

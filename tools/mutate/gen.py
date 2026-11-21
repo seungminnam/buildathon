@@ -58,7 +58,7 @@ def diff(rel, old, new):
     body = "".join(difflib.unified_diff(a, b, f"a/{rel}", f"b/{rel}", n=3))
     if not body:
         return ""
-    return f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n" + body
+    return f"diff --git a/{rel} b/{rel}\nindex 1111111..2222222 100644\n" + body
 
 
 def new_file_diff(rel, text):

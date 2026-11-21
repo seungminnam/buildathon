@@ -11,10 +11,15 @@ tarfile.open(fileobj=io.BytesIO(urllib.request.urlopen(url).read())).extractall(
  && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests > /dev/null; \
  chmod -R a+rX /opt/sqlglot
 
+# The packages the commits were labelled with, so tests the selector runs
+# itself behave as they did there.
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+
 COPY selector.py /app/selector.py
 COPY blast /app/blast
 COPY maps /app/maps
 RUN python -m compileall -q /app && chmod -R a+rX /app
 
-ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0
 CMD ["python", "/app/selector.py"]

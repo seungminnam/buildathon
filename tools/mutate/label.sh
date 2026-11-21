@@ -7,7 +7,7 @@ PLUG=$(cd "$(dirname "$0")" && pwd)
 N=${SHARDS:-1}
 i=0
 while [ $i -lt $N ]; do
-  docker run -d --rm --name "lab-$(basename "$PATCHES")-$i" -e LABEL_SHARD=$i/$N -e LABEL_WORKERS=${WORKERS:-8} \
+  docker run -d --rm --name "${PREFIX:-fw-lab}-$(basename "$(dirname "$PATCHES")")-$i" -e LABEL_SHARD=$i/$N -e LABEL_WORKERS=${WORKERS:-8} \
     -v "$SRC":/ro:ro -v "$PLUG":/plug:ro -v "$PATCHES":/patches:ro -v "$TESTS":/tests.json:ro -v "$OUT":/out \
     fw-env python /plug/label.py /patches /out/labels.$i.jsonl /tests.json >/dev/null
   i=$((i+1))
