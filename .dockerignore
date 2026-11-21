@@ -1,0 +1,7 @@
+sample/
+output.jsonl
+docs/
+tools/
+.git/
+.omc/
+**/__pycache__

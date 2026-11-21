@@ -17,3 +17,9 @@ __pycache__/
 .venv/
 node_modules/
 .DS_Store
+
+# blast radius sample kit data (download it, do not commit)
+sample/
+output.jsonl
+val/
+.omc/
