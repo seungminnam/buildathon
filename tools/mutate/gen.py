@@ -58,13 +58,13 @@ def diff(rel, old, new):
     body = "".join(difflib.unified_diff(a, b, f"a/{rel}", f"b/{rel}", n=3))
     if not body:
         return ""
-    return f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n" + body
+    return f"diff --git a/{rel} b/{rel}\nindex 1a2b3c4..5d6e7f8 100644\n" + body
 
 
 def new_file_diff(rel, text):
     lines = text.splitlines(keepends=True)
     body = "".join(difflib.unified_diff([], lines, "/dev/null", f"b/{rel}", n=3))
-    return f"diff --git a/{rel} b/{rel}\nnew file mode 100644\nindex 0000000..1111111\n" + body
+    return f"diff --git a/{rel} b/{rel}\nnew file mode 100644\nindex 0000000..5d6e7f8\n" + body
 
 
 class Source:
