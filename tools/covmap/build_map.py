@@ -11,6 +11,8 @@ Layout (test sets are stored once and referred to by index):
     classes: {module.qualname: set}    tokenizer/parser/generator/dialect classes
                                        instantiated (any class in the MRO)
     import_lines: {path: [line, ...]}  function lines that ran during collection
+    import_classes: [module.qualname]  classes (any in the MRO) instantiated
+                                       during collection, i.e. at import time
 """
 
 import json
@@ -19,11 +21,12 @@ import sys
 
 def main():
     src, dst = sys.argv[1], sys.argv[2]
-    tests, recs, imp = [], [], None
+    tests, recs, imp, imp_classes = [], [], None, set()
     for raw in open(src):
         r = json.loads(raw)
         if r["id"] == "<import>":
             imp = r
+            imp_classes.update(r.get("classes", []))
         elif not r["id"].startswith("<"):
             if r.get("outcome") not in ("passed", "skipped"):
                 print("warning:", r["id"], r.get("outcome"), file=sys.stderr)
@@ -68,6 +71,7 @@ def main():
         "opens": {p: intern(v) for p, v in sorted(open_tests.items())},
         "classes": {c: intern(v) for c, v in sorted(class_tests.items())},
         "import_lines": {p: sorted(v) for p, v in sorted((imp or {}).get("lines", {}).items())},
+        "import_classes": sorted(imp_classes),
     }
     out["sets"] = sets
     with open(dst, "w") as f:

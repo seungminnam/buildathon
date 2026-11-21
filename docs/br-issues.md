@@ -43,3 +43,17 @@ pytest-xdist로 전체 테스트를 돌리는 라벨러가 커밋 하나에 3~10
 ## 9. 확인이 실패를 계속 돌리느라 CPU를 태웠다
 
 싼 후보로 긴 테스트를 대신 판단하게 바꿨더니, 3utz처럼 후보가 줄줄이 깨지는 커밋에서 실패 34개를 시간 한도까지 돌려 CPU 36 s를 썼다. 실패하는 테스트는 traceback과 pandas 비교 때문에 통과할 때보다 훨씬 느리다. 긴 후보가 있는 커밋은 어차피 긴 테스트를 넣어야 하니, 첫 실패가 보이면 바로 멈추고 아직 안 돈 짧은 후보는 그냥 넣도록 바꿨다. sample 확인 CPU가 68 s에서 15 s로 줄었고 시뮬레이션 초는 그대로다.
+
+## 10. 한 줄 lambda가 coverage 맵에 안 잡힌다
+
+검증 커밋 av990007에서 miss가 났다. `exp.CurrentTimestamp: lambda *_: "CURRENT_TIMESTAMP"`의 문자열만 바꾼 변경인데, 맵에는 그 줄을 실행한 테스트가 0개였다. 실제로는 7개가 깨진다.
+
+원인은 `sys.monitoring`이다. LINE 이벤트만 켜면, 몸통이 시작 줄과 같은 줄에 있는 함수(한 줄 lambda)는 그 줄에 대해 LINE 이벤트가 안 온다. 작은 스크립트로 재현했다. sqlglot generator의 `TRANSFORMS`에는 이런 lambda가 수백 개 있어서 위험이 크다. 추적할 때 PY_START(함수 시작) 이벤트도 켜고, 시작한 함수의 첫 줄을 실행한 줄로 센다.
+
+## 11. Expression 클래스를 누가 쓰는지 모른다
+
+검증 커밋 av990015에서 miss가 났다. `YearOfWeek._sql_names`에서 이름 하나를 바꿨는데 `test_annotate_funcs`가 빠졌다. 맵은 Dialect/Tokenizer/Parser/Generator만 "누가 만들었는지" 기록하고 Expression 클래스는 기록하지 않았다. 또 이 테스트는 실제 작업을 프로세스 풀에서 하는데, 하위 프로세스에서는 어떤 클래스를 만들었는지 아예 기록하지 않았다. `Expr`도 기록 대상에 넣고, 하위 프로세스에서는 모듈이 import되는 순간 `__init__`을 감싸도록 `sitecustomize.py`에 import 훅을 넣었다. 테스트 하나로 확인한 뒤 맵을 다시 만들었다.
+
+## 12. import 때 만들어지는 클래스는 "쓰는 테스트"로 좁히면 안 된다
+
+검증 커밋 bv070000에서 miss가 났다. `Select.arg_types`에서 `from_`을 필수로 바꾸니 1020개 테스트가 깨졌다. sqlglot과 테스트 모듈이 import될 때 이미 `Select`를 만들어서 import 자체가 실패하기 때문이다. 맵에 "import 중에 만들어진 클래스"를 따로 저장하고, 그런 클래스의 클래스 수준 정의가 바뀌면 전체 테스트를 후보로 둔다.

@@ -14,6 +14,9 @@ class CoverageMap:
         self.opens = raw["opens"]
         self.classes = raw["classes"]
         self.import_lines = {p: set(v) for p, v in raw["import_lines"].items()}
+        # classes instances of which are built while sqlglot and the test
+        # modules import: breaking how they are built breaks the imports
+        self.import_classes = frozenset(raw.get("import_classes", ()))
         self.all = frozenset(range(len(self.tests)))
         self.by_file = {}
         for i, tid in enumerate(self.tests):

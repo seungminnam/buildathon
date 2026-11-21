@@ -473,7 +473,11 @@ class Analyzer:
         if isinstance(stmt, ast.ClassDef):
             # class header (bases, decorators, keywords): everyone using the class
             cls_chain = classes[: classes.index(stmt) + 1] if stmt in classes else classes + [stmt]
-            res.add(self.users(path, cls_chain), f"class header {stmt.name}")
+            qual = module_name(path) + "." + ".".join(c.name for c in cls_chain)
+            if qual in self.cov.import_classes:
+                res.everything(self.cov, f"class header {stmt.name}: class built at import")
+            else:
+                res.add(self.users(path, cls_chain), f"class header {stmt.name}")
             names.discard(stmt.name)
             cls_chain_for_names = None
         else:
@@ -490,6 +494,9 @@ class Analyzer:
         tests, at_import = self.refs(name)
         if cls_chain:
             qual = module_name(path) + "." + ".".join(c.name for c in cls_chain)
+            if qual in self.cov.import_classes:
+                res.everything(self.cov, f"{cls_chain[-1].name}.{name}: class built at import")
+                return
             users = self.users(path, cls_chain)
             if self.cov.instantiated(qual) is not None:
                 if at_import or not tests:

@@ -57,6 +57,16 @@ def _on_line(code, line, _optimized=CO_OPTIMIZED, _disable=mon.DISABLE):
     return _disable
 
 
+def _on_start(code, offset, _optimized=CO_OPTIMIZED, _disable=mon.DISABLE):
+    # A one-line function (`lambda *_: "X"`) gets no LINE event for its only
+    # line, so count the first line of every function that starts.
+    if code.co_flags & _optimized:
+        rel = _rel(code.co_filename)
+        if rel:
+            _lines.add((rel, code.co_firstlineno))
+    return _disable
+
+
 def _audit(event, args):
     if event == "open" and args and isinstance(args[0], str):
         rel = _rel(args[0])
@@ -68,18 +78,30 @@ def _audit(event, args):
             _opens.add("dir:" + rel)
 
 
+_types: set = set()
+
+
 def _wrap_init(cls):
+    """Remember the concrete type of every instance; the MRO is expanded at flush."""
     original = cls.__init__
+    add = _types.add
 
     def __init__(self, *args, **kwargs):
-        for t in type(self).__mro__:
-            _classes.add(f"{t.__module__}.{t.__qualname__}")
+        add(type(self))
         return original(self, *args, **kwargs)
 
     cls.__init__ = __init__
 
 
+def _expand_types():
+    for t in _types:
+        for k in t.__mro__:
+            _classes.add(f"{k.__module__}.{k.__qualname__}")
+    _types.clear()
+
+
 def _flush(nodeid, outcome, dur):
+    _expand_types()
     by_file: dict = {}
     for rel, line in _lines:
         by_file.setdefault(rel, []).append(line)
@@ -108,14 +130,16 @@ def pytest_configure(config):
     _out = open(OUT, "w")
     mon.use_tool_id(TOOL, "covmap")
     mon.register_callback(TOOL, mon.events.LINE, _on_line)
-    mon.set_events(TOOL, mon.events.LINE)
+    mon.register_callback(TOOL, mon.events.PY_START, _on_start)
+    mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
     sys.addaudithook(_audit)
     from sqlglot.dialects.dialect import Dialect
     from sqlglot.generator import Generator
     from sqlglot.parser import Parser
     from sqlglot.tokens import Tokenizer
+    from sqlglot.expressions.core import Expr
 
-    for cls in (Dialect, Tokenizer, Parser, Generator):
+    for cls in (Dialect, Tokenizer, Parser, Generator, Expr):
         _wrap_init(cls)
 
 
@@ -129,6 +153,8 @@ def _merge_sub(sub):
                     _lines.add((parts[1], int(parts[2])))
                 elif parts[0] == "O" and len(parts) == 2:
                     _opens.add(parts[1])
+                elif parts[0] == "C" and len(parts) == 2:
+                    _classes.add(parts[1])
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -153,6 +179,7 @@ def pytest_runtest_protocol(item, nextitem):
             _lines.clear()
             _opens.clear()
             _classes.clear()
+            _types.clear()
             sub = f"/tmp/covsub/{os.getpid()}"
             os.makedirs(sub, exist_ok=True)
             os.environ["TRACE_SUB_DIR"] = sub
@@ -193,6 +220,7 @@ def pytest_runtest_makereport(item, call):
 def pytest_unconfigure(config):
     mon.set_events(TOOL, 0)
     mon.register_callback(TOOL, mon.events.LINE, None)
+    mon.register_callback(TOOL, mon.events.PY_START, None)
     mon.free_tool_id(TOOL)
     if _out:
         _flush("<end>", "end", 0.0)
