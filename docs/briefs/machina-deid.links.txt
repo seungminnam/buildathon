@@ -1,0 +1,5 @@
+Download → https://www.joinbuilders.org/buildathon/tracks/machina-deid/files/challenge.pdf
+Download → https://www.joinbuilders.org/buildathon/tracks/machina-deid/files/upload.py
+challenge.pdf → https://www.joinbuilders.org/buildathon/tracks/machina-deid/files/challenge.pdf?inline=1
+https://machina-input.joinbuilders.org/get-input.sh → https://machina-input.joinbuilders.org/get-input.sh
+upload.py → https://www.joinbuilders.org/buildathon/tracks/machina-deid/files/upload.py?inline=1

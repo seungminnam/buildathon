@@ -1,0 +1,19 @@
+# data and inputs (never commit)
+input/
+data/
+output/
+scratch/
+*.parquet
+*.csv
+attempt-*/
+dev-answer/
+
+# secrets
+.env
+*.token
+
+# python / node
+__pycache__/
+.venv/
+node_modules/
+.DS_Store
