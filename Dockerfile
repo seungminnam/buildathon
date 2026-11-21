@@ -21,9 +21,12 @@ COPY maps /app/maps
 # Fixed string hashing: the TPC digest below must come out the same at
 # build time and at run time.
 ENV PYTHONHASHSEED=0 SKIP_INTEGRATION=0
-# Record of what the pinned tree computes for every TPC-H/TPC-DS query
-# (blast/tpcdigest.py). Built here so the run does not pay for it.
-RUN cd /app && python -m blast.tpcdigest /opt/sqlglot /app/maps/tpc_digest.json \
+# Precompute build-time maps on the target CPU: TPC query digests + per-query
+# coverage, baseline import fingerprint, and calibrated per-test runtimes.
+RUN cd /app \
+ && python -m blast.tpcdigest /opt/sqlglot /app/maps/tpc_digest.json \
+ && python -m blast.probe /opt/sqlglot /app/maps/probe_base.json \
+ && python -m blast.bench /opt/sqlglot /app/maps/coverage.json /app/maps/actual_ms.json \
  && python -m compileall -q /app && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1

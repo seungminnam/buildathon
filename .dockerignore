@@ -3,5 +3,8 @@
 !selector.py
 !blast/
 !maps/
+maps/tpc_digest.json
+maps/probe_base.json
+maps/actual_ms.json
 !requirements.lock
 **/__pycache__

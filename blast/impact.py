@@ -47,6 +47,8 @@ class Result:
         self.if_import_changed = set()
         self.allowed = []
         self.import_paths = set()
+        self.stmt_lines = {}
+        self.has_non_stmt = False
 
     def add(self, tests, note):
         self.tests |= set(tests)
@@ -54,6 +56,7 @@ class Result:
 
     def everything(self, cov, note):
         self.fallback = True
+        self.has_non_stmt = True
         self.add(cov.all, "ALL " + note)
 
 
@@ -339,9 +342,11 @@ class Analyzer:
         old_path, new_path = fd.old_path, fd.new_path
         path = new_path or old_path
         if fd.binary:
+            res.has_non_stmt = True
             res.add(self.cov.opened(path), f"binary {path}")
             return
         if old_path is None:
+            res.has_non_stmt = True
             self.new_file(fd, res)
             return
         old = self.text(old_path)
@@ -354,10 +359,12 @@ class Analyzer:
             return
         if new_path and old_path != new_path:
             # rename: the old path disappears
+            res.has_non_stmt = True
             res.add(self.cov.opened(old_path), f"renamed {old_path}")
         if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
             self.python(old_path, old, new, fd, res)
         else:
+            res.has_non_stmt = True
             self.data_file(old_path, res)
 
     def data_file(self, path, res):
@@ -377,6 +384,7 @@ class Analyzer:
 
     def python(self, path, old, new, fd, res):
         if new is None:
+            res.has_non_stmt = True
             res.add(self.module_tests(path), f"deleted {path}")
             return
         if same_behaviour(old, new):
@@ -389,6 +397,7 @@ class Analyzer:
         try:
             new_src = PySource(new)
         except SyntaxError:
+            res.has_non_stmt = True
             res.add(self.module_tests(path), f"syntax error {path}")
             return
         for ch in patchlib.changes(fd):
@@ -516,6 +525,7 @@ class Analyzer:
         res.if_import_changed |= part.if_import_changed
         res.allowed += part.allowed
         res.import_paths |= part.import_paths
+        res.has_non_stmt = True
         return True
 
     def _one_change(self, path, src, new_src, ch, res):
@@ -591,9 +601,13 @@ class Analyzer:
             # the function runs while modules import (decorators, registries)
             res.if_import_changed |= self.module_tests(path)
             res.notes.append(f"import-time function {path}:{line}")
+            res.has_non_stmt = True
+        else:
+            res.stmt_lines.setdefault(path, set()).update(lines)
         res.add(tests, f"stmt {path}:{line}")
 
     def definition_level(self, path, src, chain, line, res):
+        res.has_non_stmt = True
         classes = [n for n in chain if isinstance(n, ast.ClassDef)]
         stmts = [n for n in chain if isinstance(n, ast.stmt)]
         stmt = stmts[-1] if stmts else None
@@ -707,6 +721,7 @@ class Analyzer:
         for i, node in enumerate(chain):
             if isinstance(node, FUNC_NODES):
                 return  # inside a function: handled through the old position
+        res.has_non_stmt = True
         stmts = [n for n in chain if isinstance(n, ast.stmt)]
         if not stmts:
             return

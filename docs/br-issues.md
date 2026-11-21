@@ -87,3 +87,19 @@ import 중에 도는 함수(파서 테이블을 만드는 함수 등)가 바뀌�
 `FUNCTIONS`, `KEYWORDS`, `TRANSFORMS` 같은 표에서 한 줄만 바뀌면 그 클래스를 쓰는 테스트 수백 개가 후보가 됐다. 이제는 바뀐 항목의 키로 좁힌다. `exp.Foo`가 키면 `exp.Foo`를 실제로 만든 테스트(맵에 기록), SQL 문자열이 키면 테스트 클래스 소스나 읽은 fixture에 그 문자열이 나오는 테스트만 남긴다.
 
 처음엔 `arg_types`(인자 이름이 키)에도 문자열 검색을 적용했다가 miss가 났다(av990018, `'kind'`). `arg_types`는 표현식을 만들고 검증하는 방식 자체를 바꾸니 키 문자열과는 관계가 없다. 문자열 키 방식은 `FUNCTIONS`, `KEYWORDS`, `*_PARSERS`, `*_MAPPING` 표에만 쓴다.
+
+## 18. v6(7f3e94a) 서버 점수 역전: 시뮬레이션은 줄었는데 CPU가 두 배 가까이 뛰었다
+
+7f3e94a 제출 결과 시뮬레이션은 172.4 s → 151.6 s(-20.8 s, miss 0)로 줄었지만, CPU가 30.7 s → 56.7 s(+26.0 s)로 늘면서 총점이 203.1 s → 208.3 s로 나빠졌다. 프로파일링해 보니 원인은 네 군데였다.
+
+- **pytest 기동 오버헤드:** sqlglot 테스트 1,620개 전부가 표준 `unittest.TestCase`인데도 커밋마다 `pytest.main()`을 띄워 0.7 s씩 쓰고 있었다. 직접 `unittest` 러너(`blast/verify.py`)로 바꾸고, `ProcessPoolExecutor`를 인라인 실행으로 바꾸고, TPC 테스트가 없을 때는 `TestExecutor.setUpClass`의 TPC CSV 로딩을 건너뛰자 fork+import 고정비가 700 ms → 32 ms로 줄었다.
+- **실제 실행시간과 기록 시간의 괴리:** `tests.json` 기록 시간은 pytest/xdist/spawn 기준이라 실제 직접 실행 시간과 3~85배까지 차이 난다(`test_generator_memory` 6.69 s vs 실제 0.5 s, `test_agg_order` 1.36 s vs 실제 3 ms). 빌드 시점에 `blast/bench.py`로 채점기와 같은 CPU에서 1,616개 테스트의 실제 CPU 시간을 측정해 `maps/actual_ms.json`으로 저장하고, 검증 여부와 예산을 실제 시간 기준으로 결정하도록 바꿨다.
+- **TPC 다이제스트 병목:** `_plan_key`가 재귀적 `str(step)`을 호출해 $O(2^N)$으로 2.2 s를 태우고 있었고, 실행하지 않는 TPC-DS 쿼리 42개까지 `optimize`/`Plan`/`PythonExecutor`를 돌리고 있었다. `step._to_s("")` 기반 $O(N)$ 직렬화로 바꾸고, 실행 쿼리(57개)만 실행 단계를 돌며, 비실행 쿼리는 `parse_one`+`pickle` 성공 여부만 확인하도록 고쳤다(검증 커밋 bv070013에서 21.5 s 절감). 추가로 빌드 때 쿼리별 라인 커버리지와 `duck`/`py` 단계별 파일을 기록해 바뀐 코드가 닿는 쿼리와 단계만 다이제스트한다.
+- **fork 후 `gc.collect()` 폭증과 nanobind 경고:** 부모 프로세스에 올라간 4.2 MB 커버리지 맵이 fork된 자식에게 그대로 상속돼, `test_generator_memory`처럼 `gc.collect()`를 수십 번 부르는 테스트가 매번 맵 전체를 훑느라 0.5 s짜리가 6.18 s로 느려졌다. 정적 맵을 올린 직후(`duckdb`를 import하기 전) `gc.freeze()`를 호출해 해결했다. `duckdb` import 이후에 `gc.freeze()`를 부르면 nanobind 종료 시 refcount 경고가 떠서 반드시 그 전에만 동결한다.
+
+## 19. probe 잡음과 import 오탐
+
+- `probe.py`의 기준 지문을 런타임에 두 번 재던 것을 빌드 시점(`maps/probe_base.json`)으로 옮겨 런타임 CPU를 약 1.5 s 아꼈다.
+- `sqlglot/expressions/core.py`의 `UNITTEST = "unittest" in sys.modules` 값이 빌드 때와 런타임에 달라서 잡음으로 잡히던 문제를 `_NOISE` 패턴에 추가해 고쳤다.
+- 최상위 함수의 기본 인자만 바뀐 경우(`bv070082`, `simplify`)는 클로저가 아니므로 `RULES` 리스트 지문 비교에서 제외해 전체 폴백을 막았다.
+

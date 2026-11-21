@@ -26,8 +26,8 @@ import sys
 import types
 
 _ADDR = re.compile(r" at 0x[0-9a-fA-F]+")
-# state that differs between two imports of the same tree
-_NOISE = re.compile(r"(_abc_impl|_lock|_import_lock)$")
+# state that differs between two imports of the same tree (or depending on loaded stdlib)
+_NOISE = re.compile(r"(_abc_impl|_lock|_import_lock|:UNITTEST)$")
 _SKIP = (types.ModuleType, types.BuiltinFunctionType, property, staticmethod, classmethod)
 
 
@@ -50,7 +50,8 @@ def _canon(v, depth=0, seen=None):
                 cells.append(_canon(c.cell_contents, depth + 1, seen))
             except ValueError:
                 cells.append("<empty>")
-        return f"F:{v.__module__}.{v.__qualname__}({_canon(v.__defaults__, depth + 1, seen)})[{','.join(cells)}]"
+        defaults = _canon(v.__defaults__, depth + 1, seen) if v.__closure__ else ""
+        return f"F:{v.__module__}.{v.__qualname__}({defaults})[{','.join(cells)}]"
     if isinstance(v, functools.partial):
         seen = seen | {id(v)}
         return f"P:{_canon(v.func, depth + 1, seen)}{_canon(v.args, depth + 1, seen)}{_canon(v.keywords, depth + 1, seen)}"
@@ -185,3 +186,17 @@ def diff(base, new):
     """Keys whose fingerprint changed, appeared or vanished."""
     keys = set(base) | set(new)
     return sorted(k for k in keys if base.get(k) != new.get(k))
+
+
+if __name__ == "__main__":
+    import json
+
+    tree, out = sys.argv[1], sys.argv[2]
+    a, b = probe(tree), probe(tree)
+    if not (a and b and not a["errors"] and not b["errors"]):
+        sys.exit("probe baseline failed")
+    noise = sorted(set(diff(a["fp"], b["fp"])))
+    noise_set = set(noise)
+    base_fp = {k: v for k, v in a["fp"].items() if k not in noise_set}
+    json.dump({"fp": base_fp, "noise": noise}, open(out, "w"), sort_keys=True, separators=(",", ":"))
+
