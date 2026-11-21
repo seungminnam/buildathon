@@ -41,6 +41,11 @@ class Result:
         self.tests = set()
         self.notes = []
         self.fallback = False
+        # Tests that matter only if the patch changes what import builds.
+        # The selector checks that with blast/probe.py; `allowed` lists
+        # fingerprint key patterns the edit is expected to change.
+        self.if_import_changed = set()
+        self.allowed = []
 
     def add(self, tests, note):
         self.tests |= set(tests)
@@ -434,7 +439,8 @@ class Analyzer:
         fl = set(range(func.lineno, func.end_lineno + 1))
         if imp and fl & imp:
             # the function runs while modules import (decorators, registries)
-            res.add(self.module_tests(path), f"import-time function {path}:{line}")
+            res.if_import_changed |= self.module_tests(path)
+            res.notes.append(f"import-time function {path}:{line}")
         res.add(tests, f"stmt {path}:{line}")
 
     def definition_level(self, path, src, chain, line, res):
@@ -474,10 +480,11 @@ class Analyzer:
             # class header (bases, decorators, keywords): everyone using the class
             cls_chain = classes[: classes.index(stmt) + 1] if stmt in classes else classes + [stmt]
             qual = module_name(path) + "." + ".".join(c.name for c in cls_chain)
+            res.add(self.users(path, cls_chain), f"class header {stmt.name}")
             if qual in self.cov.import_classes:
-                res.everything(self.cov, f"class header {stmt.name}: class built at import")
-            else:
-                res.add(self.users(path, cls_chain), f"class header {stmt.name}")
+                res.if_import_changed |= self.cov.all
+                res.allowed.append(f"{module_name(path)}:{stmt.name}.")
+                res.notes.append(f"class header {stmt.name} built at import")
             names.discard(stmt.name)
             cls_chain_for_names = None
         else:
@@ -487,7 +494,8 @@ class Analyzer:
             self.name_impact(path, name, cls_chain_for_names, exclude, res)
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             # a broken import fails the module's import
-            res.add(self.module_tests(path), f"import in {path}")
+            res.if_import_changed |= self.module_tests(path)
+            res.notes.append(f"import in {path}")
 
     def name_impact(self, path, name, cls_chain, exclude, res, depth=0):
         """Tests affected when the definition of `name` changes."""
@@ -495,8 +503,9 @@ class Analyzer:
         if cls_chain:
             qual = module_name(path) + "." + ".".join(c.name for c in cls_chain)
             if qual in self.cov.import_classes:
-                res.everything(self.cov, f"{cls_chain[-1].name}.{name}: class built at import")
-                return
+                res.if_import_changed |= self.cov.all
+                res.allowed.append(f"{module_name(path)}:{'.'.join(c.name for c in cls_chain)}.")
+                res.notes.append(f"{cls_chain[-1].name}.{name} built at import")
             users = self.users(path, cls_chain)
             if self.cov.instantiated(qual) is not None:
                 if at_import or not tests:

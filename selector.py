@@ -19,7 +19,7 @@ from blast.covmap import CoverageMap  # noqa: E402
 from blast.impact import Analyzer, Result  # noqa: E402
 from blast.pack import cost as pack_cost  # noqa: E402
 from blast.pack import pack  # noqa: E402
-from blast import overlay, verify  # noqa: E402
+from blast import overlay, probe, verify  # noqa: E402
 
 DATA = Path(os.environ.get("BLAST_DATA", "/data"))
 SQLGLOT = os.environ.get("BLAST_SQLGLOT", "/opt/sqlglot")
@@ -99,9 +99,10 @@ def check(cid, chosen, changes, ms, deadline, notes=()):
     dear = chosen - cheap
     if not cheap:
         return chosen, "listed"
-    proxy = PROXY and bool(dear) and len(cheap) >= PROXY_MIN
+    vouch = dear & VOUCHABLE.get(cid, set())
+    proxy = PROXY and bool(vouch) and len(cheap) >= PROXY_MIN
     listed = pack_cost(pack(sorted(chosen), ms), ms)
-    after = 0 if proxy else pack_cost(pack(sorted(dear), ms), ms)
+    after = pack_cost(pack(sorted(dear - vouch if proxy else dear), ms), ms)
     run_cost = OVERHEAD_MS + CPU_RATIO * sum(ms[n] for n in cheap)
     gain = pass_chance(notes) * (listed - after)
     left = deadline - time.monotonic()
@@ -125,11 +126,20 @@ def check(cid, chosen, changes, ms, deadline, notes=()):
     if not ok:
         return chosen, info + " incomplete"
     if proxy and not bad:
-        return set(), info + f" dropped {len(dear)} long"
+        return dear - vouch, info + f" dropped {len(vouch)} of {len(dear)} long"
     return dear | bad, info
 
 
 NODEID = {}
+VOUCHABLE = {}
+
+
+def merge(res, part):
+    res.tests |= part.tests
+    res.notes += part.notes
+    res.fallback = res.fallback or part.fallback
+    res.if_import_changed |= part.if_import_changed
+    res.allowed += part.allowed
 
 
 def children_cpu():
@@ -156,13 +166,18 @@ def main():
     paths = sorted((DATA / "commits").glob("*.patch"))
     deadline = time.monotonic() + min(160.0, 3.5 * max(len(paths), 1))
     plans = []
+    pending_probe = {}
     for path in paths:
         cid = path.stem
         res = Result()
+        parts = []
         changes = {}
         try:
             for fd in patchlib.parse(path.read_text(errors="replace")):
-                analyzer.analyze(fd, res)
+                part = Result()
+                analyzer.analyze(fd, part)
+                merge(res, part)
+                parts.append((fd.path, part))
                 if changes is not None:
                     changes = add_change(changes, fd)
         except Exception as e:  # never crash on a strange patch: run everything
@@ -170,13 +185,64 @@ def main():
             res.everything(cov, "error")
             changes = None
         chosen = {local_to_number[i] for i in res.tests if local_to_number[i] is not None}
-        if res.tests and unmapped:
+        extra = {local_to_number[i] for i in res.if_import_changed if local_to_number[i] is not None}
+        if (res.tests or extra) and unmapped:
             chosen.update(unmapped)
+        if extra - chosen:
+            if changes is None or not VERIFY:
+                chosen |= extra
+                res.notes.append("import not checked")
+            else:
+                pending_probe[cid] = (extra, res.allowed)
+        # Long tests the cheap ones may vouch for: every file that makes the
+        # long test a candidate must be Python code and must also make at
+        # least PROXY_MIN cheap tests candidates. A long test that reads an
+        # edited fixture is never vouched for by tests that do not read it.
+        vouchable = set()
+        if not res.fallback:
+            per_file = []
+            for fpath, part in parts:
+                nums = {local_to_number[i] for i in part.tests | part.if_import_changed if local_to_number[i] is not None}
+                ok = fpath.endswith(".py") and sum(1 for n in nums if ms[n] <= RUN_MAX_MS) >= PROXY_MIN
+                per_file.append((nums, ok))
+            for n in chosen | extra:
+                if ms[n] > RUN_MAX_MS and all(ok for nums, ok in per_file if n in nums):
+                    vouchable.add(n)
+        VOUCHABLE[cid] = vouchable
         plans.append((cid, chosen, changes, res.notes))
 
     if VERIFY:
         verify.warm_up()
+    base_fp = None
+    base_noise = set()
     for cid, chosen, changes, notes in plans:
+        if cid in pending_probe:
+            extra, allowed = pending_probe[cid]
+            try:
+                if base_fp is None:
+                    # two imports of the pinned tree: keys that differ between
+                    # them (orders of sets, addresses) are noise
+                    a, b = probe.probe(SQLGLOT), probe.probe(SQLGLOT)
+                    base_fp = {}
+                    if a and b and not a["errors"] and not b["errors"]:
+                        noise = set(probe.diff(a["fp"], b["fp"]))
+                        base_fp = {k: v for k, v in a["fp"].items() if k not in noise}
+                        base_noise = noise
+                tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes)
+                got = probe.probe(tree)
+                overlay.remove(tree)
+                changed = None
+                if got and not got["errors"] and base_fp:
+                    new_fp = {k: v for k, v in got["fp"].items() if k not in base_noise}
+                    changed = [k for k in probe.diff(base_fp, new_fp) if not any(k.startswith(a) for a in allowed)]
+                if changed is None or changed:
+                    chosen = chosen | extra
+                    notes = notes + [f"import changed: {(changed or ['error'])[:3]}"]
+                else:
+                    notes = notes + ["import unchanged"]
+            except Exception as e:  # unsure: keep them
+                chosen = chosen | extra
+                notes = notes + [f"probe failed {type(e).__name__}"]
         keep, how = chosen, "listed"
         if VERIFY and changes is not None and chosen:
             try:
