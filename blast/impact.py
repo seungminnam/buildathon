@@ -54,6 +54,9 @@ class Result:
         self.class_line_pairs = []
         self.class_class_pairs = []
         self.has_non_class = False
+        # pytest config or a conftest changed: the in-container check runs
+        # tests without pytest, so it cannot see the change; list, never check
+        self.no_verify = False
 
     def add(self, tests, note):
         self.tests |= set(tests)
@@ -221,6 +224,48 @@ def same_behaviour(old, new):
     """True when two sources parse to the same tree, docstrings aside."""
     try:
         return _same_ast(ast.parse(old), ast.parse(new))
+    except SyntaxError:
+        return False
+
+
+# PEP 263: a coding declaration on the first or second line
+_COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=]", re.M)
+# bytes that were not UTF-8 in the patch (read with errors="surrogateescape")
+_UNDECODABLE = re.compile("[\udc80-\udcff]")
+
+
+def needs_bytes_check(text):
+    head = "\n".join(text.split("\n", 2)[:2])
+    return bool(_COOKIE.search(head) or _UNDECODABLE.search(text))
+
+
+def file_bytes(text):
+    return text.encode("utf-8", "surrogateescape")
+
+
+def declared_encoding(text):
+    """The encoding an import decodes the file with, or None when it cannot."""
+    try:
+        enc = tokenize.detect_encoding(io.BytesIO(file_bytes(text)).readline)[0]
+    except SyntaxError:
+        return None
+    return enc[: -len("-sig")] if enc.endswith("-sig") else enc
+
+
+def compiles(text, path="<patched>"):
+    """Compiles the way an import reads it (from bytes), unlike ast.parse(str):
+    a coding cookie counts, a non-UTF-8 byte inside a comment does not."""
+    try:
+        compile(file_bytes(text), path, "exec", ast.PyCF_ONLY_AST, dont_inherit=True)
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
+def same_behaviour_bytes(old, new):
+    """same_behaviour, reading both sources as bytes the way an import does."""
+    try:
+        return _same_ast(ast.parse(file_bytes(old)), ast.parse(file_bytes(new)))
     except SyntaxError:
         return False
 
@@ -442,6 +487,29 @@ class Analyzer:
                 out.update(self.cov.sets[s])
         return out
 
+    def lazy_importers(self, path):
+        """Tests that ran an import statement naming the module at `path`: imports
+        inside function bodies, which the import probe cannot see."""
+        mod = module_name(path)
+        stem = mod.rsplit(".", 1)[-1]
+        if stem == "__init__" or not stem:
+            return set()
+        out = set()
+        by_word = re.compile(r"\bimport\b.*\b%s\b" % re.escape(stem))
+        for p, ln in self.mentions(stem):
+            line = (self.text(p) or "").split("\n")[ln - 1]
+            if "import" in line and (mod in line or by_word.search(line)):
+                out |= self.cov.tests_for_lines(p, {ln})
+        return out
+
+    def order_sensitive(self):
+        """test_generator_memory builds every dialect's generator under tracemalloc and
+        fails when memory grows. With a sqlglot module deleted or renamed it failed under
+        pytest-xdist (the kit's labelling environment has pytest-xdist 3.8.0), though it
+        passes alone and in a plain single-process run: an order effect. It costs ~6.7 s
+        recorded; a miss costs 300."""
+        return {i for i, tid in enumerate(self.cov.tests) if tid.endswith("::test_generator_memory")}
+
     def test_module_tests(self, path):
         out = set(self.cov.by_file.get(path, set()))
         mod = module_name(path)
@@ -484,6 +552,13 @@ class Analyzer:
     def _analyze(self, fd, res):
         old_path, new_path = fd.old_path, fd.new_path
         path = new_path or old_path
+        scope = self.pytest_scope(fd)
+        if scope is not None:
+            res.has_non_stmt = True
+            res.has_non_class = True
+            res.no_verify = True
+            res.add(scope, f"pytest config {path}")
+            return
         if fd.binary:
             res.has_non_stmt = True
             res.has_non_class = True
@@ -507,12 +582,67 @@ class Analyzer:
             res.has_non_stmt = True
             res.has_non_class = True
             res.add(self.cov.opened(old_path), f"renamed {old_path}")
+            if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
+                # the old module name stops existing: whatever imports it breaks
+                res.add(self.module_tests(old_path), f"moved module {old_path}")
+                res.add(self.lazy_importers(old_path), f"lazy imports of {old_path}")
+                if old_path.startswith("sqlglot/"):
+                    res.add(self.order_sensitive(), "order-sensitive under xdist")
         if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
             self.python(old_path, old, new, fd, res)
         else:
             self.data_file(old_path, old, new, res)
 
+    _PYTEST_CONFIG = ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml")
+
+    def pytest_scope(self, fd):
+        """Tests a change to pytest's own configuration can alter, or None.
+
+        A conftest.py reaches the tests under its directory; pytest settings
+        (pytest.ini, or a pytest section of tox.ini, setup.cfg, pyproject.toml)
+        reach every test. Other edits of those files (version, tooling) do not."""
+        for p in (fd.old_path, fd.new_path):
+            if p and os.path.basename(p) == "conftest.py":
+                d = os.path.dirname(p)
+                return {i for i, tid in enumerate(self.cov.tests) if not d or tid.startswith(d + "/")}
+        path = fd.new_path or fd.old_path
+        if path not in self._PYTEST_CONFIG:
+            return None
+        if path == "pytest.ini" or fd.binary:
+            return set(self.cov.all)
+        old = self.text(fd.old_path) if fd.old_path else ""
+        new = patchlib.apply(old or "", fd) if fd.new_path else ""
+        if old is None or new is None:
+            return set(self.cov.all)
+
+        def section(lines, ln):
+            for i in range(min(ln, len(lines)) - 1, -1, -1):
+                s = lines[i].strip()
+                if s.startswith("[") and "]" in s:
+                    return s
+            return ""
+
+        # only the section a changed line sits in counts (a header line is its own
+        # section), so adding "pytest" to a dependency list does not trigger
+        old_lines, new_lines = old.split("\n"), new.split("\n")
+        for ch in patchlib.changes(fd):
+            secs = [section(new_lines, nl) for nl in ch.new_lines]
+            if ch.kind in ("mod", "del"):
+                secs.append(section(old_lines, ch.old_line))
+            if any("pytest" in s for s in secs):
+                return set(self.cov.all)
+        return None
+
     def data_file(self, path, old, new, res):
+        if new is not None and _UNDECODABLE.search(new):
+            res.has_non_stmt = True
+            res.has_non_class = True
+            if os.path.basename(path) in self._PYTEST_CONFIG:
+                res.no_verify = True
+                res.everything(self.cov, f"undecodable pytest config {path}")
+                return
+            res.add(self.cov.opened(path), f"undecodable text {path}")
+            return
         if new is not None and path.endswith(".sql"):
             if is_sql_fixture_pair_file(path):
                 a = parse_sql_fixture_pairs(old)
@@ -554,7 +684,27 @@ class Analyzer:
             res.has_non_stmt = True
             res.has_non_class = True
             res.add(self.module_tests(path), f"deleted {path}")
+            res.add(self.lazy_importers(path), f"lazy imports of {path}")
+            if path.startswith("sqlglot/"):
+                res.add(self.order_sensitive(), "order-sensitive under xdist")
             return
+        if needs_bytes_check(new) or needs_bytes_check(old):
+            # an import reads bytes: a coding cookie that does not fit the file, or a
+            # non-UTF-8 byte in code, breaks it although ast.parse(str) sees no change
+            if not compiles(new, path):
+                res.has_non_stmt = True
+                res.has_non_class = True
+                res.add(self.module_tests(path), f"import-level text {path}")
+                return
+            if same_behaviour_bytes(old, new):
+                res.notes.append(f"no-op {path}")
+                return
+            if declared_encoding(new) != declared_encoding(old) or _UNDECODABLE.search(new):
+                # the decoded text changes, or the str-level analysis cannot read it
+                res.has_non_stmt = True
+                res.has_non_class = True
+                res.add(self.module_tests(path), f"import-level text {path}")
+                return
         src = self.source(path)
         if src is None:
             res.everything(self.cov, f"unparsable {path}")

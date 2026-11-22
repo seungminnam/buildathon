@@ -766,6 +766,7 @@ def merge(res, part):
     res.tests |= part.tests
     res.notes += part.notes
     res.fallback = res.fallback or part.fallback
+    res.no_verify = res.no_verify or part.no_verify
     res.if_import_changed |= part.if_import_changed
     res.allowed += part.allowed
     res.import_paths |= part.import_paths
@@ -834,7 +835,7 @@ def main():
         changes = {}
         active_paths = set()
         edited_lines = {}
-        patch_text = path.read_text(errors="replace")
+        patch_text = path.read_text(encoding="utf-8", errors="surrogateescape")
         try:
             for fd in patchlib.parse(patch_text):
                 part = Result()
@@ -856,6 +857,8 @@ def main():
         except Exception as e:  # never crash on a strange patch: run everything
             log(f"{cid}: analysis failed ({type(e).__name__}: {e}); running all tests")
             res.everything(cov, "error")
+            changes = None
+        if res.no_verify:
             changes = None
         chosen = {local_to_number[i] for i in res.tests if local_to_number[i] is not None}
         extra = {local_to_number[i] for i in res.if_import_changed if local_to_number[i] is not None}
