@@ -507,6 +507,12 @@ class Analyzer:
             res.has_non_stmt = True
             res.has_non_class = True
             res.add(self.cov.opened(old_path), f"renamed {old_path}")
+            if old_path.endswith(".py") and old_path.startswith("sqlglot/"):
+                # sqlglot also imports modules by name at run time (a dialect
+                # is loaded from sqlglot.dialects.<name>), so nothing may import
+                # the old path statically and still every user of it breaks
+                users = self.module_users(old_path)
+                res.add(users, f"renamed module users {old_path}")
         if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
             self.python(old_path, old, new, fd, res)
         else:

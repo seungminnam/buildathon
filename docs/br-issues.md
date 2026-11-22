@@ -165,3 +165,7 @@ v8(`c8cd459`, 서버 **140.7 s** = 시뮬 126.75 + CPU 13.96, miss 0)을 amd64 �
 - patch가 새로 추가한 파일의 import 에러는 무시한다(아무도 import하지 않는다).
 
 고친 뒤 sample 30, 기존 검증 117, 새 검증 32개 모두 miss 0이다.
+
+## 24. 연습에 없을 법한 변경을 직접 만들어 넣어 봤다
+
+파일 이름 변경, 파일 삭제, `pyproject.toml`, README, `tests/helpers.py`, 테스트 메서드 이름 변경을 직접 patch로 만들어 돌렸다. 대부분은 정상이거나 보수적으로 처리됐는데, `sqlglot/dialects/druid.py`의 이름을 바꾸는 경우 후보가 0개였다. sqlglot은 dialect를 이름으로 찾아서 실행 중에 import한다(`"druid"` → `sqlglot.dialects.druid`). 그래서 정적으로 import하는 곳이 없어 probe도 조용했지만, druid를 쓰는 테스트는 전부 깨진다. sqlglot 모듈의 이름이 바뀌면 원래 모듈의 사용자(코드를 실행했거나 그 모듈의 클래스를 만든 테스트)를 후보에 넣는다.

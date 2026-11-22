@@ -202,20 +202,20 @@ def load_everything(tree):
     return errors
 
 
-def run_probe(tree, fd):
+def run_probe(tree, fd, with_fp=True):
     """Child side: write {"errors": [...], "fp": {...}} as JSON to fd."""
     import json
 
     try:
         errors = load_everything(tree)
-        fp = fingerprint()
+        fp = fingerprint() if with_fp else {}
         data = json.dumps({"errors": errors, "fp": fp})
     except BaseException as e:  # noqa: BLE001
         data = json.dumps({"errors": [["<probe>", repr(e)]], "fp": {}})
     os.write(fd, data.encode())
 
 
-def probe(tree, timeout=30):
+def probe(tree, timeout=30, with_fp=True):
     """Fork a child that imports `tree` and fingerprints it. None on failure."""
     import json
     import select
@@ -230,7 +230,7 @@ def probe(tree, timeout=30):
             null = os.open(os.devnull, os.O_RDWR)
             for fd in (0, 1, 2):
                 os.dup2(null, fd)
-            run_probe(tree, w)
+            run_probe(tree, w, with_fp)
         finally:
             os._exit(0)
     os.close(w)

@@ -965,7 +965,7 @@ def main():
                 p0 = children_cpu()
                 try:
                     if errors_only:
-                        got = probe.probe(get_tree())
+                        got = probe.probe(get_tree(), with_fp=False)
                         errs = None if got is None else [e for e in got["errors"] if not new_module(e[0], changes)]
                         if errs is None or len(errs) > MAX_NARROW_BREAKS:
                             force_all = True
