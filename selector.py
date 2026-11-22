@@ -43,6 +43,11 @@ SKIP_P_FAIL = float(os.environ.get("BLAST_SKIP_P_FAIL", "0.60"))
 SKIP_P_CLEAN = float(os.environ.get("BLAST_SKIP_P_CLEAN", "0.85"))
 PROXY = os.environ.get("BLAST_PROXY", "1") == "1"
 PROXY_MIN = int(os.environ.get("BLAST_PROXY_MIN", "3"))
+# a check whose child reports nothing for this long is hung (an edit that loops
+# forever): kill it and keep every candidate, as on any timeout
+STALL_S = float(os.environ.get("BLAST_STALL_S", "10"))
+# a full TPC digest takes ~5-8 s of CPU; a hung one used to wait out 45 s
+DIGEST_MAX_S = float(os.environ.get("BLAST_DIGEST_MAX_S", "20"))
 
 TEST_MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GIANT_TESTS = {
@@ -415,6 +420,7 @@ def check(
             stop_on_fail=stop_early,
             item_filters=item_filters,
             budget_ctx=budget_ctx,
+            stall=STALL_S,
         )
     finally:
         if own_tree:
@@ -683,7 +689,7 @@ def tpc_check(
     try:
         same = tpcdigest.run(
             tree,
-            timeout=min(45, left - 4),
+            timeout=min(DIGEST_MAX_S, left - 4),
             base=TPC_BASE,
             suites=tuple(suites_run),
             query_filter=query_filter or None,

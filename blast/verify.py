@@ -901,7 +901,7 @@ def _kill(pid):
             pass
 
 
-def run(tree, nodeids, timeout, stop_on_fail=False, item_filters=None, budget_ctx=None):
+def run(tree, nodeids, timeout, stop_on_fail=False, item_filters=None, budget_ctx=None, stall=None):
     """Returns (failed nodeids, finished nodeids, files that failed to collect, ok).
 
     ok is False when the child did not exit cleanly (killed on the deadline or
@@ -947,9 +947,13 @@ def run(tree, nodeids, timeout, stop_on_fail=False, item_filters=None, budget_ct
     os.close(w)
     buf = b""
     deadline = time.monotonic() + timeout
+    last = time.monotonic()
     killed = stopped = False
     while True:
-        left = deadline - time.monotonic()
+        now = time.monotonic()
+        left = deadline - now
+        if stall is not None:
+            left = min(left, last + stall - now)
         if left <= 0:
             _kill(pid)
             killed = True
@@ -958,6 +962,7 @@ def run(tree, nodeids, timeout, stop_on_fail=False, item_filters=None, budget_ct
         if not ready:
             continue
         chunk = os.read(r, 65536)
+        last = time.monotonic()
         if not chunk:
             break
         buf += chunk
