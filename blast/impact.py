@@ -897,6 +897,17 @@ class Analyzer:
                 all_exp = False
         return _store(("ok", reach, changed_nodes, exp_quals if all_exp else None))
 
+    def _no_new_keys(self, old_dict, new_src, cls_names, target_name):
+        """True when the edited table's keys in the new source are a subset of the old
+        ones: the edit changes or deletes entries but adds none."""
+        new_dict = self._find_dict_by_owner(new_src, cls_names, target_name)
+        if new_dict is None or not isinstance(old_dict, ast.Dict) or not isinstance(new_dict, ast.Dict):
+            return False
+        if any(k is None for k in new_dict.keys):
+            return False
+        old_keys = {ast.dump(k) for k in old_dict.keys if k is not None}
+        return all(ast.dump(k) in old_keys for k in new_dict.keys)
+
     def _key_tests(self, key):
         """Tests that could reach entry `key`; None when we cannot tell."""
         if isinstance(key, ast.Attribute) and isinstance(key.value, ast.Name) and key.value.id == "exp":
@@ -1057,6 +1068,12 @@ class Analyzer:
         res.notes.append(f"entry {key_txt}: {len(narrowed)} of {len(part.tests)}")
         res.if_import_changed |= part.if_import_changed
         res.allowed += part.allowed
+        if cls_names and target_name and self._no_new_keys(owner[2], new_src, cls_names, target_name):
+            # subclasses copy the table ({**Base.TABLE, ...}): the import probe sees
+            # their copies change by this same entry, which `reach` already covers.
+            # Only for edits that add no key (a changed value, a deleted entry): those
+            # are the shapes QA validated; a new key keeps the probe's answer.
+            res.allowed.append("*." + target_name)
         res.import_paths |= part.import_paths
         for p, lns in part.stmt_lines.items():
             res.stmt_lines.setdefault(p, set()).update(lns)

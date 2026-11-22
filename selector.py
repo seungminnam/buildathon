@@ -953,7 +953,10 @@ def main():
                     changed = None
                     if got and not got["errors"] and base_fp:
                         new_fp = {k: v for k, v in got["fp"].items() if k not in base_noise}
-                        changed = [k for k in probe.diff(base_fp, new_fp) if not any(k.startswith(a) for a in allowed)]
+                        changed = [
+                        k for k in probe.diff(base_fp, new_fp)
+                        if not any(k.endswith(a[1:]) if a.startswith("*.") else k.startswith(a) for a in allowed)
+                    ]
                     broken = import_breakage(got, analyzer, local_to_number) if got and got["errors"] else None
                     if broken is not None:
                         chosen = chosen | broken
