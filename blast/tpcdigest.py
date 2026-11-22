@@ -199,7 +199,12 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
     return duck_h, py_h, opt_h, had_err
 
 
-MAX_REAL_VERIFY = 4
+MAX_REAL_VERIFY = 40
+REAL_BUDGET_S = {
+    "tpcds_exec": 4.5,
+    "tpch_exec": 1.2,
+    "tpch_opt": 1.2,
+}
 
 
 class _RealVerifier:
@@ -398,19 +403,27 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
     """Build or compare TPC query digests.
 
     Without `base`: returns full build-time artifact dict including per-query
-    hashes (`hashes`), per-stage files (`stage_files`), and per-query line
-    coverage (`q_lines`).
+    hashes (`hashes`), per-stage files (`stage_files`), per-query line coverage
+    (`q_lines`), per-query core execution line coverage (`py_core_lines`), and
+    baseline optimized SQL (`opt_sqls`) for fast SQL-only verification.
     With `base`: returns {test_node_id: True/False}, stopping each test at its
-    first differing query (after checking up to MAX_REAL_VERIFY non-error
-    mismatches against the exact TestExecutor DuckDB/PythonExecutor comparison).
+    first differing query (after checking non-error mismatches against the exact
+    TestExecutor DuckDB/PythonExecutor comparison within a CPU budget).
     `query_filter`: optional {suite_group ("tpch"/"tpcds"): set of query indices}
-    `stages`: optional {suite_group: ("duck", "py")} restricting which stages run.
+    `stages`: optional {suite_group: tuple of ("duck", "py", "dbg_sql", "real")}.
     """
+    import base64
+    import time
+    import zlib
+
     sys.path.insert(0, tree)
     os.chdir(tree)
     os.environ["SKIP_INTEGRATION"] = "0"
-    from sqlglot.executor.table import ensure_tables
+    from sqlglot import find_tables, parse_one
     from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.optimizer import optimize
+    from sqlglot.planner import Plan
     from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
 
     schemas = {"TPCH_SCHEMA": TPCH_SCHEMA, "TPCDS_SCHEMA": TPCDS_SCHEMA}
@@ -429,8 +442,9 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
         t_start, t_stop, t_close = _make_tracer(tree)
         out_hashes = {TEST_TPCH: {}, TEST_TPCH_OPT: {}, TEST_TPCDS: {}}
         stage_files = {}  # "tpch:duck", "tpch:py", "tpcds:duck", "tpcds:py" -> sorted files
-        # q_lines: {group: {relpath: {line: [query_indices]}}}
         q_lines = {}
+        py_core_lines = {}
+        opt_exprs = {}
         try:
             for grp, (schema_name, fixture, rel_dir) in SUITES_INFO.items():
                 schema = schemas[schema_name]
@@ -438,6 +452,8 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
                 exec_test = TEST_TPCH if grp == "tpch" else TEST_TPCDS
                 d_files, p_files = set(), set()
                 grp_lines = {}
+                core_lines = {}
+                grp_opt_expr = {}
                 for i, (meta, sql, optimized) in enumerate(load_sql_fixture_pairs(fixture)):
                     t_start()
                     dh, _, oh, _ = _digest_one_query(
@@ -446,6 +462,25 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
                     )
                     dl = t_stop()
                     d_files.update(dl.keys())
+
+                    # Trace ONLY the real execute() core (parse, pickle, find_tables,
+                    # optimize, Plan, PythonExecutor) without expr.sql() / _plan_key()
+                    t_start()
+                    parsed_c = parse_one(sql)
+                    pickled_c = pickle.loads(pickle.dumps(parsed_c))
+                    if meta.get("execute"):
+                        _ = sorted(t.name for t in find_tables(pickled_c))
+                        expr_c = optimize(pickled_c, schema, leave_tables_isolated=True)
+                        plan_c = Plan(expr_c)
+                        _ = PythonExecutor(tables=tables_).execute(plan_c)
+                    cl = t_stop()
+                    for p, lns in cl.items():
+                        per = core_lines.setdefault(p, set())
+                        per.update(lns)
+                    if meta.get("execute"):
+                        grp_opt_expr[str(i)] = base64.b64encode(
+                            zlib.compress(pickle.dumps(expr_c), 6)
+                        ).decode("ascii")
 
                     t_start()
                     _, ph, _, _ = _digest_one_query(
@@ -458,7 +493,6 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
                     out_hashes[exec_test][str(i)] = [dh, ph]
                     if grp == "tpch":
                         out_hashes[TEST_TPCH_OPT][str(i)] = oh
-                    # merge lines for query i
                     for p, lns in dl.items():
                         per = grp_lines.setdefault(p, {})
                         for ln in lns:
@@ -473,12 +507,21 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
                     p: {str(ln): sorted(qs) for ln, qs in per.items()}
                     for p, per in grp_lines.items()
                 }
+                py_core_lines[grp] = {p: sorted(lns) for p, lns in core_lines.items()}
+                opt_exprs[grp] = grp_opt_expr
         finally:
             t_close()
-        return {"hashes": out_hashes, "stage_files": stage_files, "q_lines": q_lines}
+        return {
+            "hashes": out_hashes,
+            "stage_files": stage_files,
+            "q_lines": q_lines,
+            "py_core_lines": py_core_lines,
+            "opt_exprs": opt_exprs,
+        }
 
     # Runtime comparison mode
     base_hashes = base["hashes"]
+    base_opt_exprs = base.get("opt_exprs", {})
     same = {}
     want = set(suites)
     for grp, (schema_name, fixture, rel_dir) in SUITES_INFO.items():
@@ -493,8 +536,10 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
         ref_opt = base_hashes.get(TEST_TPCH_OPT, {}) if do_opt else {}
 
         allowed_stages = set((stages or {}).get(grp, ("duck", "py")))
+        direct_real = "real" in allowed_stages
         need_duck = do_exec and ("duck" in allowed_stages)
         need_py = do_exec and ("py" in allowed_stages)
+        need_dbg_sql = do_exec and ("dbg_sql" in allowed_stages) and not need_py
 
         schema = schemas[schema_name]
         tables_ = None
@@ -505,25 +550,67 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
         pairs = list(load_sql_fixture_pairs(fixture))
         exec_ok = do_exec and len(pairs) == len(ref_exec)
         opt_ok = do_opt and len(pairs) == len(ref_opt)
+        grp_opt_expr = base_opt_exprs.get(grp, {})
 
         verifier = None
         real_exec_checks = 0
         real_opt_checks = 0
+        real_exec_cpu = 0.0
+        real_opt_cpu = 0.0
+        exec_budget = REAL_BUDGET_S.get(exec_key, 2.0)
+        opt_budget = REAL_BUDGET_S.get(opt_key, 1.2)
         try:
             for i, (meta, sql, optimized) in enumerate(pairs):
                 if q_subset is not None and i not in q_subset:
                     continue
+                if direct_real:
+                    if not exec_ok:
+                        break
+                    if not meta.get("execute"):
+                        try:
+                            pickle.loads(pickle.dumps(parse_one(sql)))
+                        except BaseException:  # noqa: BLE001
+                            exec_ok = False
+                        continue
+                    if real_exec_cpu >= exec_budget or real_exec_checks >= MAX_REAL_VERIFY:
+                        exec_ok = False
+                        break
+                    real_exec_checks += 1
+                    t_r0 = time.process_time()
+                    if verifier is None:
+                        verifier = _RealVerifier(FIXTURES_DIR + rel_dir, schema, _open_file)
+                    ok_v = verifier.verify_exec(meta, sql)
+                    real_exec_cpu += time.process_time() - t_r0
+                    if not ok_v:
+                        exec_ok = False
+                    continue
+
                 cur_duck = need_duck and exec_ok
                 cur_py = need_py and exec_ok
+                cur_dbg = need_dbg_sql and exec_ok
                 cur_opt = do_opt and opt_ok
-                if not (cur_duck or cur_py or cur_opt):
+                if not (cur_duck or cur_py or cur_dbg or cur_opt):
                     break
-                dh, ph, oh, had_err = _digest_one_query(
-                    meta, sql, optimized, schema, tables_,
-                    need_duck=cur_duck, need_py=cur_py, need_opt=cur_opt, code_log=code_log,
-                )
+                dh = ph = oh = None
+                had_err = False
+                if cur_duck or cur_py or cur_opt:
+                    dh, ph, oh, had_err = _digest_one_query(
+                        meta, sql, optimized, schema, tables_,
+                        need_duck=cur_duck, need_py=cur_py, need_opt=cur_opt, code_log=code_log,
+                    )
                 si = str(i)
-                if exec_ok:
+                if cur_dbg and meta.get("execute"):
+                    # execute() calls logger.debug("...", expression.sql(pretty=True))
+                    blob = grp_opt_expr.get(si)
+                    if blob is None:
+                        exec_ok = False
+                    else:
+                        try:
+                            expr_obj = pickle.loads(zlib.decompress(base64.b64decode(blob)))
+                            expr_obj.sql(pretty=True)
+                        except BaseException:  # noqa: BLE001
+                            exec_ok = False
+                if exec_ok and (cur_duck or cur_py):
                     ref_pair = ref_exec.get(si)
                     exec_mismatch = (
                         ref_pair is None
@@ -531,23 +618,29 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
                         or (cur_py and ph != ref_pair[1])
                     )
                     if exec_mismatch:
-                        if had_err or real_exec_checks >= MAX_REAL_VERIFY:
+                        if had_err or real_exec_checks >= MAX_REAL_VERIFY or real_exec_cpu >= exec_budget:
                             exec_ok = False
                         else:
                             real_exec_checks += 1
+                            t_r0 = time.process_time()
                             if verifier is None:
                                 verifier = _RealVerifier(FIXTURES_DIR + rel_dir, schema, _open_file)
-                            if not verifier.verify_exec(meta, sql):
+                            ok_v = verifier.verify_exec(meta, sql)
+                            real_exec_cpu += time.process_time() - t_r0
+                            if not ok_v:
                                 exec_ok = False
                 if opt_ok and cur_opt:
                     if oh != ref_opt.get(si):
-                        if had_err or real_opt_checks >= MAX_REAL_VERIFY:
+                        if had_err or real_opt_checks >= MAX_REAL_VERIFY or real_opt_cpu >= opt_budget:
                             opt_ok = False
                         else:
                             real_opt_checks += 1
+                            t_r0 = time.process_time()
                             if verifier is None:
                                 verifier = _RealVerifier(FIXTURES_DIR + rel_dir, schema, _open_file)
-                            if not verifier.verify_opt(sql, optimized):
+                            ok_v = verifier.verify_opt(sql, optimized)
+                            real_opt_cpu += time.process_time() - t_r0
+                            if not ok_v:
                                 opt_ok = False
         finally:
             if verifier is not None:

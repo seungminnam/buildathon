@@ -44,8 +44,9 @@ SKIP_P_CLEAN = float(os.environ.get("BLAST_SKIP_P_CLEAN", "0.85"))
 PROXY = os.environ.get("BLAST_PROXY", "1") == "1"
 PROXY_MIN = int(os.environ.get("BLAST_PROXY_MIN", "3"))
 
+TEST_MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GIANT_TESTS = {
-    "tests/test_parser.py::TestParser::test_max_nodes",
+    TEST_MAX_NODES,
     tpcdigest.TEST_TPCDS,
     tpcdigest.TEST_TPCH,
     tpcdigest.TEST_TPCH_OPT,
@@ -107,6 +108,24 @@ def pass_chance(notes):
     if kinds and all(k in ("opened", "no-op") for k in kinds):
         return 0.02
     return 0.5
+
+
+def max_nodes_fast_ok(changes, active_paths, patch_text, edited_lines, res):
+    """True when scaled _fast_max_nodes is sound for test_max_nodes."""
+    if changes is None or res.fallback:
+        return False
+    if "tests/test_parser.py" in active_paths:
+        return False
+    low = patch_text.lower()
+    if "max_nodes" in low or "node_count" in low:
+        return False
+    for ln in edited_lines.get("sqlglot/parser.py", ()):
+        if (375 <= ln <= 410) or (2030 <= ln <= 2090) or (2190 <= ln <= 2220):
+            return False
+    for ln in edited_lines.get("sqlglot/parsers/athena.py", ()):
+        if 30 <= ln <= 75:
+            return False
+    return True
 
 
 def subcov_filters(cid, chosen, res, active_paths):
@@ -258,6 +277,8 @@ def check(
     res=None,
     active_paths=(),
     p_pass_override=None,
+    get_tree=None,
+    fast_max_nodes=False,
 ):
     """Run fast candidates against the patched tree; keep what fails.
 
@@ -268,6 +289,16 @@ def check(
     item_filters, eff_actual = (
         subcov_filters(cid, chosen, res, active_paths) if res is not None else (None, {})
     )
+    fast_giants = set()
+    if fast_max_nodes:
+        for n in chosen:
+            if NODEID[n] == TEST_MAX_NODES:
+                fast_giants.add(n)
+                eff_actual[n] = 20
+                if item_filters is None:
+                    item_filters = {}
+                item_filters[TEST_MAX_NODES] = {"__fast_max_nodes__": True}
+                break
 
     def est_ms(n):
         return eff_actual.get(n, ACTUAL_MS[n])
@@ -275,31 +306,40 @@ def check(
     fix_tests = FIXTURE_TESTS.get(cid, set())
     cheap = {
         n for n in chosen
-        if n not in fix_tests and NODEID[n] not in GIANT_TESTS and est_ms(n) <= RUN_MAX_ACTUAL_MS
+        if n not in fix_tests
+        and (NODEID[n] not in GIANT_TESTS or n in fast_giants)
+        and est_ms(n) <= min(3200, max(RUN_MAX_ACTUAL_MS, int(0.80 * ms[n])))
     }
-    # A single moderately slow code test (e.g. test_tpcds) can still be worth
-    # running when it is the only candidate (saving its duration + 2 s worker cost).
+    # A single moderately slow code test (e.g. test_optimizer::test_tpcds) can
+    # still be worth running when it is the only candidate (saving its duration + 2 s worker).
     if not cheap and len(chosen) == 1:
         only = next(iter(chosen))
-        if only not in fix_tests and NODEID[only] not in GIANT_TESTS and est_ms(only) <= 2600:
+        if (
+            only not in fix_tests
+            and (NODEID[only] not in GIANT_TESTS or only in fast_giants)
+            and est_ms(only) <= min(4200, int(0.85 * (ms[only] + 2000)))
+        ):
             cheap = {only}
     dear = chosen - cheap
     if not cheap:
         return chosen, "listed", False
 
+    listed = pack_cost(pack(sorted(chosen), ms), ms)
     cheap_actual = sum(est_ms(n) for n in cheap)
+    batch_cap = max(RUN_MAX_BATCH_ACTUAL_MS, min(11000, int(0.75 * listed)))
     subset_mode = False
-    if cheap_actual > RUN_MAX_BATCH_ACTUAL_MS:
+    if cheap_actual > batch_cap:
         # Too expensive to run every candidate: pick a high-leverage subset
-        # whose recorded duration far exceeds its actual runtime (no proxy).
+        # whose recorded duration exceeds its actual runtime (no proxy).
+        sub_budget = min(5000, max(SUBSET_BUDGET_MS, int(0.30 * listed)))
         ranked = sorted(
-            (n for n in cheap if ms[n] >= max(300, int(1.8 * est_ms(n)))),
+            (n for n in cheap if ms[n] >= max(250, int(1.25 * est_ms(n)))),
             key=lambda n: -(ms[n] - est_ms(n)),
         )
         sub, acc = set(), 0
         for n in ranked:
             a = est_ms(n)
-            if acc + a > SUBSET_BUDGET_MS:
+            if acc + a > sub_budget:
                 continue
             sub.add(n)
             acc += a
@@ -314,27 +354,45 @@ def check(
     if vouch and tpc_applicable(changes):
         vouch = vouch - set(TPC)
     proxy = PROXY and bool(vouch) and len(cheap) >= PROXY_MIN
-    listed = pack_cost(pack(sorted(chosen), ms), ms)
     after_pass = pack_cost(pack(sorted(dear - vouch if proxy else dear), ms), ms)
 
     run_cost = OVERHEAD_MS + CPU_RATIO * cheap_actual
     p_pass = p_pass_override if p_pass_override is not None else pass_chance(notes)
 
     partial_saving = 0
-    if not subset_mode and len(cheap) >= 4 and p_pass >= 0.3:
-        if dear:
-            dear_cost = pack_cost(pack(sorted(dear), ms), ms)
-            partial_saving = max(0, listed - dear_cost)
-        else:
-            est_fail_ms = int(0.18 * sum(ms[n] for n in cheap))
-            partial_saving = max(0, listed - (2000 + est_fail_ms))
+    if p_pass >= 0.3:
+        if subset_mode:
+            partial_saving = int(0.5 * max(0, listed - after_pass))
+        elif len(cheap) >= 4:
+            if dear:
+                dear_cost = pack_cost(pack(sorted(dear), ms), ms)
+                partial_saving = max(0, listed - dear_cost)
+            else:
+                est_fail_ms = int(0.18 * sum(ms[n] for n in cheap))
+                partial_saving = max(0, listed - (2000 + est_fail_ms))
 
     gain = p_pass * (listed - after_pass) + (1.0 - p_pass) * partial_saving
     left = deadline - time.monotonic()
     if gain <= run_cost or left < 4:
-        return chosen, "listed", False
+        if left >= 4 and fast_giants and fast_giants < cheap:
+            fg_actual = sum(est_ms(n) for n in fast_giants)
+            fg_cost = OVERHEAD_MS + CPU_RATIO * fg_actual
+            fg_saving = listed - pack_cost(pack(sorted(chosen - fast_giants), ms), ms)
+            if p_pass * fg_saving > fg_cost:
+                cheap = set(fast_giants)
+                dear = chosen - cheap
+                cheap_actual = fg_actual
+                run_cost = fg_cost
+                subset_mode = True
+                proxy = False
+                vouch = set()
+            else:
+                return chosen, "listed", False
+        else:
+            return chosen, "listed", False
 
-    tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes)
+    own_tree = get_tree is None
+    tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes) if own_tree else get_tree()
     ids = [NODEID[n] for n in sorted(cheap, key=lambda n: (est_ms(n), NODEID[n]))]
     has_giant_dear = bool(dear) and max(ms[n] for n in dear) >= 15000
     stop_early = allow_stop_early and (not subset_mode) and has_giant_dear and cheap_actual > 600
@@ -347,19 +405,21 @@ def check(
             "dear": [ms[n] for n in dear],
             "cpu_ratio": CPU_RATIO,
             "p_fail": SKIP_P_FAIL,
-            "p_clean": SKIP_P_CLEAN,
         }
     c0 = children_cpu()
-    failed, done, broken, ok = verify.run(
-        tree,
-        ids,
-        timeout,
-        stop_on_fail=stop_early,
-        item_filters=item_filters,
-        budget_ctx=budget_ctx,
-    )
+    try:
+        failed, done, broken, ok = verify.run(
+            tree,
+            ids,
+            timeout,
+            stop_on_fail=stop_early,
+            item_filters=item_filters,
+            budget_ctx=budget_ctx,
+        )
+    finally:
+        if own_tree:
+            overlay.remove(tree)
     cpu = children_cpu() - c0
-    overlay.remove(tree)
 
     bad = set()
     unrun = set()
@@ -381,7 +441,11 @@ def check(
         return dear - vouch, info + f" dropped {len(vouch)} of {len(dear)} long", False
     if not bad and len(dear) == 1 and p_pass_override is None:
         only = next(iter(dear))
-        if only not in fix_tests and NODEID[only] not in GIANT_TESTS and est_ms(only) <= 2300:
+        if (
+            only not in fix_tests
+            and (NODEID[only] not in GIANT_TESTS or only in fast_giants)
+            and est_ms(only) <= min(4200, int(0.85 * (ms[only] + 2000)))
+        ):
             keep2, info2, _ = check(
                 cid,
                 dear,
@@ -393,6 +457,8 @@ def check(
                 res=res,
                 active_paths=active_paths,
                 p_pass_override=0.80,
+                get_tree=get_tree,
+                fast_max_nodes=fast_max_nodes,
             )
             if info2 != "listed":
                 return keep2, info + " + " + info2, False
@@ -433,11 +499,17 @@ def _tpc_fixture_diff(fixture_rel, changes):
     return tpc_sql_changed_indices(old_text, new_text)
 
 
-def tpc_check(cid, keep, changes, ms, deadline, res, active_paths):
+def tpc_check(
+    cid, keep, changes, ms, deadline, res, active_paths, get_tree=None, max_estimate=None, checked_suites=None
+):
     global TPC_BASE
     tpc = keep & set(TPC)
-    if not tpc or not tpc_applicable(changes):
-        return keep, " digest n/a" if tpc else ""
+    if checked_suites:
+        tpc = {n for n in tpc if TPC[n] not in checked_suites}
+    if not tpc:
+        return keep, ""
+    if not tpc_applicable(changes):
+        return keep, ("" if max_estimate is not None else " digest n/a")
     if TPC_BASE is None:
         if not os.path.isfile(TPC_MAP):
             return keep, ""
@@ -445,6 +517,7 @@ def tpc_check(cid, keep, changes, ms, deadline, res, active_paths):
 
     stage_files = TPC_BASE.get("stage_files", {})
     q_lines = TPC_BASE.get("q_lines", {})
+    py_core_lines = TPC_BASE.get("py_core_lines", {})
     suites_needed = sorted({TPC[n] for n in tpc})
     groups_needed = sorted({"tpch" if s.startswith("tpch") else "tpcds" for s in suites_needed})
 
@@ -516,7 +589,7 @@ def tpc_check(cid, keep, changes, ms, deadline, res, active_paths):
             if can_filter:
                 query_filter[grp] = qset
 
-        # Stage filtering: check which stages (duck / py) any active edited file can reach
+        # Stage filtering: check which stages (duck / py / dbg_sql) any active edited file can reach
         grp_stages = []
         for st in ("duck", "py"):
             sf = set(stage_files.get(f"{grp}:{st}", ()))
@@ -533,6 +606,15 @@ def tpc_check(cid, keep, changes, ms, deadline, res, active_paths):
                     touched = True
                     break
             if touched:
+                if st == "py" and pure_stmt and grp in py_core_lines and fix_rel not in active_paths:
+                    core_map = py_core_lines[grp]
+                    hits_core = any(
+                        bool(lns & set(core_map.get(p, ())))
+                        for p, lns in res.stmt_lines.items()
+                    )
+                    if not hits_core:
+                        grp_stages.append("dbg_sql")
+                        continue
                 grp_stages.append(st)
         stages[grp] = tuple(grp_stages)
         if not grp_stages:
@@ -556,9 +638,8 @@ def tpc_check(cid, keep, changes, ms, deadline, res, active_paths):
         if sk not in suites_run:
             suites_run.append(sk)
     if not suites_run:
-        return keep, ""
+        return keep, (f" digest auto-dropped {len(auto_drop)}" if auto_drop else "")
 
-    saving = pack_cost(pack(sorted(keep), ms), ms) - pack_cost(pack(sorted(keep - tpc), ms), ms)
     # Estimate digest CPU based on stages and filtered query count
     estimate = 150
     for sk in suites_run:
@@ -567,32 +648,65 @@ def tpc_check(cid, keep, changes, ms, deadline, res, active_paths):
         elif sk == "tpch_exec":
             st = stages.get("tpch", ("duck", "py"))
             nq = len(query_filter["tpch"]) if "tpch" in query_filter else 22
-            estimate += (25 if "py" in st else 6) * nq
+            if "real" in st:
+                estimate += 120 * nq
+            elif "py" in st:
+                estimate += 25 * nq
+            else:
+                estimate += 6 * nq
         elif sk == "tpcds_exec":
             st = stages.get("tpcds", ("duck", "py"))
             nq = len(query_filter["tpcds"]) if "tpcds" in query_filter else 57
-            estimate += (35 if "py" in st else 8) * min(nq, 57)
+            if "real" in st:
+                estimate += 250 * min(nq, 15)
+            elif "py" in st:
+                estimate += 35 * min(nq, 57)
+            else:
+                estimate += 8 * min(nq, 57)
+
+    if max_estimate is not None and estimate > max_estimate:
+        return keep, (f" digest auto-dropped {len(auto_drop)}" if auto_drop else "")
+
+    if max_estimate is not None:
+        saving = sum(ms[n] for n in tpc) + 2000
+    else:
+        saving = pack_cost(pack(sorted(keep), ms), ms) - pack_cost(pack(sorted(keep - tpc), ms), ms)
 
     left = deadline - time.monotonic()
     if saving <= estimate or left < 10:
         return keep, (f" digest auto-dropped {len(auto_drop)}" if auto_drop else "")
 
     verify.warm_up_heavy()
-    tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes)
+    own_tree = get_tree is None
+    tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes) if own_tree else get_tree()
     c0 = children_cpu()
-    same = tpcdigest.run(
-        tree,
-        timeout=min(45, left - 4),
-        base=TPC_BASE,
-        suites=tuple(suites_run),
-        query_filter=query_filter or None,
-        stages=stages or None,
-    ) or {}
+    try:
+        same = tpcdigest.run(
+            tree,
+            timeout=min(45, left - 4),
+            base=TPC_BASE,
+            suites=tuple(suites_run),
+            query_filter=query_filter or None,
+            stages=stages or None,
+        ) or {}
+    finally:
+        if own_tree:
+            overlay.remove(tree)
     cpu = children_cpu() - c0
-    overlay.remove(tree)
+    if checked_suites is not None:
+        checked_suites.update(suites_run)
     drop = {n for n in tpc if same.get(NODEID[n]) is True}
     total_dropped = len(drop) + len(auto_drop)
     return keep - drop, f" digest {suites_run} cpu {cpu:.2f}s dropped {total_dropped}"
+
+
+def _mod_to_path(mod):
+    base = os.path.join(SQLGLOT, *mod.split("."))
+    if os.path.isfile(base + ".py"):
+        return mod.replace(".", "/") + ".py"
+    if os.path.isfile(os.path.join(base, "__init__.py")):
+        return mod.replace(".", "/") + "/__init__.py"
+    return None
 
 
 def import_breakage(got, analyzer, local_to_number):
@@ -601,12 +715,8 @@ def import_breakage(got, analyzer, local_to_number):
     for mod, _msg in got["errors"]:
         if mod in ("sqlglot", "tests", "<probe>") or mod.count(".") < 1:
             return None
-        base = os.path.join(SQLGLOT, *mod.split("."))
-        if os.path.isfile(base + ".py"):
-            path = mod.replace(".", "/") + ".py"
-        elif os.path.isfile(os.path.join(base, "__init__.py")):
-            path = mod.replace(".", "/") + "/__init__.py"
-        else:
+        path = _mod_to_path(mod)
+        if path is None:
             return None
         if path.startswith("tests/"):
             local = analyzer.cov.by_file.get(path, set())
@@ -614,6 +724,42 @@ def import_breakage(got, analyzer, local_to_number):
             local = analyzer.module_users(path)
         out |= {local_to_number[i] for i in local if local_to_number[i] is not None}
     return out
+
+
+def probe_change_impact(changed, analyzer, cov, local_to_number):
+    """Narrow non-empty probe fingerprint changes to the tests using the changed
+    classes or globals, or return None to fall back to `extra`."""
+    if not changed:
+        return None
+    local = set()
+    for key in changed:
+        mod, sep, rest = key.partition(":")
+        if not sep:
+            return None
+        path = _mod_to_path(mod)
+        if path is None:
+            return None
+        if "." in rest:
+            cls_part, _attr = rest.rsplit(".", 1)
+            qual = f"{mod}.{cls_part}"
+            inst = cov.instantiated(qual)
+            if inst is None:
+                return None
+            local |= inst
+            local |= cov.opened(path)
+        else:
+            name = rest
+            if path.startswith("sqlglot/typing/") and name == "EXPRESSION_METADATA":
+                local |= cov.opened(path)
+                local |= cov.by_file.get("tests/test_typing.py", set())
+                local |= analyzer.module_users(path)
+            else:
+                tests, at_import = analyzer.refs(name)
+                if at_import:
+                    return None
+                local |= tests
+                local |= cov.opened(path)
+    return {local_to_number[i] for i in local if local_to_number[i] is not None}
 
 
 def merge(res, part):
@@ -687,8 +833,10 @@ def main():
         parts = []
         changes = {}
         active_paths = set()
+        edited_lines = {}
+        patch_text = path.read_text(errors="replace")
         try:
-            for fd in patchlib.parse(path.read_text(errors="replace")):
+            for fd in patchlib.parse(patch_text):
                 part = Result()
                 analyzer.analyze(fd, part)
                 merge(res, part)
@@ -696,6 +844,11 @@ def main():
                 if not (len(part.notes) == 1 and part.notes[0].startswith("no-op ")):
                     if fd.old_path:
                         active_paths.add(fd.old_path)
+                        el = edited_lines.setdefault(fd.old_path, set())
+                        for ch in patchlib.changes(fd):
+                            el.add(ch.old_line)
+                            if ch.kind == "ins" and ch.old_line > 1:
+                                el.add(ch.old_line - 1)
                     if fd.new_path:
                         active_paths.add(fd.new_path)
                 if changes is not None:
@@ -742,7 +895,7 @@ def main():
         VOUCHABLE[cid] = vouchable
         FIXTURE_TESTS[cid] = fix_tests
         NO_SUBCOV[cid] = no_subcov
-        plans.append((cid, chosen, changes, res, active_paths))
+        plans.append((cid, chosen, changes, res, active_paths, patch_text, edited_lines))
 
     global TPC_BASE, SUBCOV
     base_fp = None
@@ -753,7 +906,7 @@ def main():
             base_fp = pdata.get("fp")
             base_noise = set(pdata.get("noise", ()))
         if TPC_BASE is None and os.path.isfile(TPC_MAP) and any(
-            (chosen & set(TPC)) for _cid, chosen, _ch, _r, _ap in plans
+            (chosen & set(TPC)) for _cid, chosen, _ch, _r, _ap, _pt, _el in plans
         ):
             TPC_BASE = json.load(open(TPC_MAP))
         if SUBCOV is None and os.path.isfile(SUBCOV_MAP):
@@ -765,88 +918,142 @@ def main():
                 )
         verify.warm_up()
 
-    for cid, chosen, changes, res, active_paths in plans:
+    for cid, chosen, changes, res, active_paths, patch_text, edited_lines in plans:
         notes = res.notes
-        if cid in pending_probe:
-            verify.warm_up_probe()
-            extra, allowed = pending_probe[cid]
-            p0 = children_cpu()
-            try:
-                if base_fp is None:
-                    a, b = probe.probe(SQLGLOT), probe.probe(SQLGLOT)
-                    base_fp = {}
-                    if a and b and not a["errors"] and not b["errors"]:
-                        noise = set(probe.diff(a["fp"], b["fp"]))
-                        base_fp = {k: v for k, v in a["fp"].items() if k not in noise}
-                        base_noise = noise
-                tree = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes)
-                got = probe.probe(tree)
-                overlay.remove(tree)
-                changed = None
-                if got and not got["errors"] and base_fp:
-                    new_fp = {k: v for k, v in got["fp"].items() if k not in base_noise}
-                    changed = [k for k in probe.diff(base_fp, new_fp) if not any(k.startswith(a) for a in allowed)]
-                broken = import_breakage(got, analyzer, local_to_number) if got and got["errors"] else None
-                if broken is not None:
-                    chosen = chosen | broken
-                    res.has_non_class = True
-                    if res.import_stmt_lines:
-                        res.has_non_stmt = True
-                    notes = notes + [f"import breaks {len(got['errors'])} modules: {len(broken)} tests"]
-                elif changed is None or changed:
+        tree_holder = [None]
+
+        def get_tree():
+            if tree_holder[0] is None:
+                tree_holder[0] = overlay.build(SQLGLOT, os.path.join(WORK, cid), changes)
+            return tree_holder[0]
+
+        try:
+            if cid in pending_probe:
+                verify.warm_up_probe()
+                extra, allowed = pending_probe[cid]
+                p0 = children_cpu()
+                try:
+                    if base_fp is None:
+                        a, b = probe.probe(SQLGLOT), probe.probe(SQLGLOT)
+                        base_fp = {}
+                        if a and b and not a["errors"] and not b["errors"]:
+                            noise = set(probe.diff(a["fp"], b["fp"]))
+                            base_fp = {k: v for k, v in a["fp"].items() if k not in noise}
+                            base_noise = noise
+                    got = probe.probe(get_tree())
+                    changed = None
+                    if got and not got["errors"] and base_fp:
+                        new_fp = {k: v for k, v in got["fp"].items() if k not in base_noise}
+                        changed = [k for k in probe.diff(base_fp, new_fp) if not any(k.startswith(a) for a in allowed)]
+                    broken = import_breakage(got, analyzer, local_to_number) if got and got["errors"] else None
+                    if broken is not None:
+                        chosen = chosen | broken
+                        res.has_non_class = True
+                        if res.import_stmt_lines:
+                            res.has_non_stmt = True
+                        notes = notes + [f"import breaks {len(got['errors'])} modules: {len(broken)} tests"]
+                    elif changed is None or changed:
+                        narrowed = (
+                            probe_change_impact(changed, analyzer, cov, local_to_number)
+                            if changed
+                            else None
+                        )
+                        if narrowed is not None:
+                            chosen = chosen | narrowed
+                            notes = notes + [f"import changed (narrowed {len(narrowed)}): {changed[:3]}"]
+                        else:
+                            chosen = chosen | extra
+                            notes = notes + [f"import changed: {(changed or ['error'])[:3]}"]
+                        res.has_non_class = True
+                        if res.import_stmt_lines:
+                            res.has_non_stmt = True
+                    else:
+                        for p, lns in res.import_stmt_lines.items():
+                            res.stmt_lines.setdefault(p, set()).update(lns)
+                        notes = notes + ["import unchanged"]
+                except Exception as e:  # unsure: keep them
                     chosen = chosen | extra
                     res.has_non_class = True
                     if res.import_stmt_lines:
                         res.has_non_stmt = True
-                    notes = notes + [f"import changed: {(changed or ['error'])[:3]}"]
-                else:
-                    for p, lns in res.import_stmt_lines.items():
-                        res.stmt_lines.setdefault(p, set()).update(lns)
-                    notes = notes + ["import unchanged"]
-            except Exception as e:  # unsure: keep them
-                chosen = chosen | extra
+                    notes = notes + [f"probe failed {type(e).__name__}"]
+                notes = notes + [f"probe cpu {children_cpu() - p0:.2f}s"]
+            elif res.import_stmt_lines:
+                res.has_non_stmt = True
                 res.has_non_class = True
-                if res.import_stmt_lines:
-                    res.has_non_stmt = True
-                notes = notes + [f"probe failed {type(e).__name__}"]
-            notes = notes + [f"probe cpu {children_cpu() - p0:.2f}s"]
-        elif res.import_stmt_lines:
-            res.has_non_stmt = True
-            res.has_non_class = True
-        keep, how, stopped_early = chosen, "listed", False
-        if VERIFY and changes is not None and chosen:
-            try:
-                keep, how, stopped_early = check(
-                    cid, chosen, changes, ms, deadline, notes, res=res, active_paths=active_paths
-                )
-            except Exception as e:  # a failed check keeps every candidate
-                log(f"{cid}: check failed ({type(e).__name__}: {e})")
-                keep, how, stopped_early = chosen, "check-error", False
-        if VERIFY and changes is not None and keep & set(TPC):
-            before_tpc = len(keep)
-            how_pre = how
-            try:
-                keep, more = tpc_check(cid, keep, changes, ms, deadline, res, active_paths)
-                how += more
-            except Exception as e:  # unsure: keep them
-                how += f" digest failed {type(e).__name__}"
-            if (stopped_early or how_pre == "listed" or len(keep) == 1) and len(keep) < before_tpc and keep:
+
+            fast_mn = max_nodes_fast_ok(changes, active_paths, patch_text, edited_lines, res)
+            keep, how, stopped_early = chosen, "listed", False
+            pre_tpc_info = ""
+            tpc_done = set()
+            if VERIFY and changes is not None and keep & set(TPC):
                 try:
-                    keep, how2, _ = check(
+                    keep, pre_tpc_info = tpc_check(
+                        cid, keep, changes, ms, deadline, res, active_paths,
+                        get_tree=get_tree, max_estimate=600, checked_suites=tpc_done,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    pre_tpc_info = f" digest failed {type(e).__name__}"
+
+            if VERIFY and changes is not None and keep:
+                try:
+                    keep, how, stopped_early = check(
                         cid,
                         keep,
                         changes,
                         ms,
                         deadline,
                         notes,
-                        allow_stop_early=False,
                         res=res,
                         active_paths=active_paths,
+                        get_tree=get_tree,
+                        fast_max_nodes=fast_mn,
                     )
-                    if how2 != "listed":
-                        how += " + " + how2
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # a failed check keeps every candidate
+                    log(f"{cid}: check failed ({type(e).__name__}: {e})")
+                    keep, how, stopped_early = keep, "check-error", False
+            if pre_tpc_info:
+                how = (how + pre_tpc_info) if how != "listed" else pre_tpc_info.lstrip()
+
+            if VERIFY and changes is not None and keep & set(TPC):
+                before_tpc = len(keep)
+                how_pre = how
+                try:
+                    keep, more = tpc_check(
+                        cid, keep, changes, ms, deadline, res, active_paths,
+                        get_tree=get_tree, checked_suites=tpc_done,
+                    )
+                    how += more
+                except Exception as e:  # unsure: keep them
+                    how += f" digest failed {type(e).__name__}"
+                if (
+                    stopped_early
+                    or how_pre == "listed"
+                    or how_pre.startswith("subset 1 ")
+                    or len(keep) == 1
+                ) and len(keep) < before_tpc and keep:
+                    try:
+                        keep, how2, _ = check(
+                            cid,
+                            keep,
+                            changes,
+                            ms,
+                            deadline,
+                            notes,
+                            allow_stop_early=False,
+                            res=res,
+                            active_paths=active_paths,
+                            get_tree=get_tree,
+                            fast_max_nodes=fast_mn,
+                        )
+                        if how2 != "listed":
+                            how += " + " + how2
+                    except Exception:  # noqa: BLE001
+                        pass
+        finally:
+            if tree_holder[0] is not None:
+                overlay.remove(tree_holder[0])
+
         workers = pack(sorted(keep), ms)
         log(
             f"{cid}: {len(chosen)} candidates, {how}, {len(keep)} kept, {len(workers)} workers,"

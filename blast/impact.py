@@ -574,46 +574,178 @@ class Analyzer:
         if _same_ast(src.tree, new_src.tree, hint_line):
             res.notes.append(f"no-op {path}")
             return
+        dict_cache = {}
         for ch in changes:
-            self.one_change(path, src, new_src, ch, res)
+            self.one_change(path, src, new_src, ch, res, dict_cache)
 
-    def one_change(self, path, src, new_src, ch, res):
-        if ch.kind == "mod" and self.dict_entry_change(path, src, new_src, ch, res):
+    def one_change(self, path, src, new_src, ch, res, dict_cache=None):
+        if self.dict_entry_change(path, src, new_src, ch, res, dict_cache):
             return
         self._one_change(path, src, new_src, ch, res)
 
-    # --- one entry of a class-level table -------------------------------------------------
+    # --- entries of a class-level or module-level table -----------------------------------
 
     # tables keyed by SQL text (function names, keywords, format tokens): a
     # test can only reach an entry by writing its key somewhere
     _TEXT_TABLES = re.compile(r"^(FUNCTIONS|NO_PAREN_FUNCTIONS|KEYWORDS|[A-Z_]*_PARSERS|[A-Z_]*_MAPPING)$")
 
     @staticmethod
-    def _entry_key(src, line):
-        """Key node of the class-level dict entry on `line`, or None.
-
-        Only entries that sit on one line and belong to a dict that is the
-        value of a class-body assignment qualify."""
+    def _enclosing_dict(src, line):
+        """Return (cls_names_tuple, target_name, dict_node) if `line` sits inside a
+        class-body or module-body dict assignment, else None."""
+        if not (1 <= line <= len(src.lines)):
+            return None
         col = src.first_col(line)
         chain = src.chain_at(line, col)
         for i, node in enumerate(chain):
-            if isinstance(node, FUNC_NODES):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 break
-            if isinstance(node, ast.Dict) and i + 1 < len(chain):
-                child = chain[i + 1]
-                for k, v in zip(node.keys, node.values):
-                    if k is None:
-                        continue
-                    if child is k or child is v:
-                        first = k.lineno
-                        last = v.end_lineno
-                        owner = [n for n in chain[:i] if isinstance(n, (ast.Assign, ast.AnnAssign))]
-                        if first == line == last and owner and any(isinstance(n, ast.ClassDef) for n in chain[:i]):
-                            tgt = owner[-1].targets[0] if isinstance(owner[-1], ast.Assign) else owner[-1].target
-                            k.table = tgt.id if isinstance(tgt, ast.Name) else ""
-                            return k
+            if isinstance(node, ast.Dict):
+                if i == 0:
+                    return None
+                owner = chain[i - 1]
+                if not isinstance(owner, (ast.Assign, ast.AnnAssign)) or owner.value is not node:
+                    return None
+                if isinstance(owner, ast.Assign):
+                    if len(owner.targets) != 1 or not isinstance(owner.targets[0], ast.Name):
                         return None
+                    target_name = owner.targets[0].id
+                else:
+                    if not isinstance(owner.target, ast.Name):
+                        return None
+                    target_name = owner.target.id
+                if any(isinstance(n, FUNC_NODES) for n in chain[:i]):
+                    return None
+                cls_names = tuple(n.name for n in chain[:i] if isinstance(n, ast.ClassDef))
+                return cls_names, target_name, node
         return None
+
+    @staticmethod
+    def _find_dict_by_owner(src, cls_names, target_name):
+        """Find the unique dict assigned to `target_name` inside `cls_names`."""
+        container = src.tree
+        for cname in cls_names:
+            matches = [n for n in container.body if isinstance(n, ast.ClassDef) and n.name == cname]
+            if len(matches) != 1:
+                return None
+            container = matches[0]
+        found = []
+        for st in container.body:
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                if st.targets[0].id == target_name:
+                    found.append(st.value)
+            elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                if st.target.id == target_name:
+                    found.append(st.value)
+        if len(found) == 1 and isinstance(found[0], ast.Dict):
+            return found[0]
+        return None
+
+    @staticmethod
+    def _is_exp_attr(node):
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "exp"
+        )
+
+    @classmethod
+    def _expand_dict(cls, dict_node):
+        """Return (spread_dumps, [(key_dump, key_node, val_dump), ...])."""
+        spreads = []
+        entries = []
+        for k, v in zip(dict_node.keys, dict_node.values):
+            if k is None:
+                if (
+                    isinstance(v, ast.DictComp)
+                    and len(v.generators) == 1
+                    and not v.generators[0].ifs
+                    and isinstance(v.key, ast.Name)
+                    and isinstance(v.generators[0].target, ast.Name)
+                    and v.key.id == v.generators[0].target.id
+                    and isinstance(v.generators[0].iter, (ast.Set, ast.Tuple, ast.List))
+                    and v.generators[0].iter.elts
+                    and all(cls._is_exp_attr(el) for el in v.generators[0].iter.elts)
+                ):
+                    vd = ast.dump(v.value)
+                    for el in v.generators[0].iter.elts:
+                        entries.append((ast.dump(el), el, vd))
+                else:
+                    spreads.append(ast.dump(v))
+            else:
+                entries.append((ast.dump(k), k, ast.dump(v)))
+        return spreads, entries
+
+    def _diff_dict_table(self, path, src, new_src, cls_names, target_name, dict_cache):
+        """Diff old vs new dict for `(cls_names, target_name)`.
+
+        Returns:
+          - None if narrowing does not safely apply
+          - ("noop", None, None, None) if the dict AST is completely unchanged
+          - ("ok", reach_set, changed_key_nodes, all_exp_quals)
+        """
+        ckey = (cls_names, target_name)
+        if dict_cache is not None and ckey in dict_cache:
+            return dict_cache[ckey]
+
+        def _store(val):
+            if dict_cache is not None:
+                dict_cache[ckey] = val
+            return val
+
+        old_dict = self._find_dict_by_owner(src, cls_names, target_name)
+        new_dict = self._find_dict_by_owner(new_src, cls_names, target_name)
+        if old_dict is None or new_dict is None:
+            return _store(None)
+        old_spreads, old_entries = self._expand_dict(old_dict)
+        new_spreads, new_entries = self._expand_dict(new_dict)
+        if old_spreads != new_spreads:
+            return _store(None)
+        if [(kd, vd) for kd, _, vd in old_entries] == [(kd, vd) for kd, _, vd in new_entries]:
+            return _store(("noop", None, None, None))
+        old_vals, old_node = {}, {}
+        for kd, k, vd in old_entries:
+            old_vals.setdefault(kd, []).append(vd)
+            old_node[kd] = k
+        new_vals, new_node = {}, {}
+        for kd, k, vd in new_entries:
+            new_vals.setdefault(kd, []).append(vd)
+            new_node[kd] = k
+        changed_kds = {
+            kd
+            for kd in (old_vals.keys() | new_vals.keys())
+            if old_vals.get(kd) != new_vals.get(kd)
+        }
+        # Reject edits that reorder unchanged keys (dict iteration order can matter)
+        old_order = [kd for kd, _, _ in old_entries if kd not in changed_kds]
+        new_order = [kd for kd, _, _ in new_entries if kd not in changed_kds]
+        if old_order != new_order or not changed_kds:
+            return _store(None)
+
+        reach = set(self.cov.opened(path))
+        if target_name == "EXPRESSION_METADATA":
+            reach |= self.cov.by_file.get("tests/test_typing.py", set())
+        changed_nodes = []
+        exp_quals = set()
+        all_exp = True
+        for kd in sorted(changed_kds):
+            k = old_node[kd] if kd in old_node else new_node[kd]
+            if not cls_names and not self._is_exp_attr(k):
+                return _store(None)
+            k.table = target_name
+            t = self._key_tests(k)
+            if t is None:
+                return _store(None)
+            reach |= t
+            changed_nodes.append(k)
+            if self._is_exp_attr(k):
+                ename = k.attr
+                for qual in self.cov.classes:
+                    if qual.startswith("sqlglot.expressions.") and qual.rsplit(".", 1)[-1] == ename:
+                        exp_quals.add(qual)
+            else:
+                all_exp = False
+        return _store(("ok", reach, changed_nodes, exp_quals if all_exp else None))
 
     def _key_tests(self, key):
         """Tests that could reach entry `key`; None when we cannot tell."""
@@ -698,46 +830,90 @@ class Analyzer:
                 out.update(self.cov.sets[s])
         return out
 
-    def dict_entry_change(self, path, src, new_src, ch, res):
-        """A one-line edit of one entry of a class-level table (FUNCTIONS,
-        KEYWORDS, TRANSFORMS...). Narrow the usual class-users answer to the
-        tests that can reach that entry: for an expression-class key, the
-        tests that built that expression; for a string key, the tests whose
-        source or fixtures mention it. Returns False when it does not apply."""
-        if not ch.new_lines:
-            return False
-        k_old = self._entry_key(src, ch.old_line)
-        k_new = self._entry_key(new_src, ch.new_lines[0])
-        if k_old is None or k_new is None:
-            return False
-        reach = set()
-        for k in (k_old, k_new):
-            t = self._key_tests(k)
-            if t is None:
+    def dict_entry_change(self, path, src, new_src, ch, res, dict_cache=None):
+        """An edit (mod/ins/del, single- or multi-line) inside a class-level or
+        module-level table (FUNCTIONS, KEYWORDS, TRANSFORMS, EXPRESSION_METADATA...).
+        Narrow the usual class/module-users answer to the tests that can reach the
+        changed entries. Returns False when it does not apply."""
+        owner = None
+        if ch.kind in ("mod", "del"):
+            if ch.old_text.strip() == "" or ch.old_text.lstrip().startswith("#"):
                 return False
-            reach |= t
+            info = self._enclosing_dict(src, ch.old_line)
+            if info is None:
+                return False
+            cls_names, target_name, old_dict = info
+            if ch.kind == "mod" and ch.new_lines:
+                for nl in ch.new_lines:
+                    if 1 <= nl <= len(new_src.lines):
+                        txt = new_src.lines[nl - 1].strip()
+                        if txt and not txt.startswith("#"):
+                            ninfo = self._enclosing_dict(new_src, nl)
+                            if ninfo is None or (ninfo[0], ninfo[1]) != (cls_names, target_name):
+                                return False
+            owner = (cls_names, target_name, old_dict)
+        else:
+            code_nls = [
+                nl
+                for nl in ch.new_lines
+                if 1 <= nl <= len(new_src.lines)
+                and new_src.lines[nl - 1].strip() != ""
+                and not new_src.lines[nl - 1].lstrip().startswith("#")
+            ]
+            if not code_nls:
+                return False
+            first = self._enclosing_dict(new_src, code_nls[0])
+            if first is None:
+                return False
+            cls_names, target_name, _ = first
+            for nl in code_nls[1:]:
+                ni = self._enclosing_dict(new_src, nl)
+                if ni is None or (ni[0], ni[1]) != (cls_names, target_name):
+                    return False
+            old_dict = self._find_dict_by_owner(src, cls_names, target_name)
+            if old_dict is None:
+                return False
+            before = ch.old_line - 1
+            while before >= 1 and (
+                src.lines[before - 1].strip() == "" or src.lines[before - 1].lstrip().startswith("#")
+            ):
+                before -= 1
+            after = ch.old_line
+            while after <= len(src.lines) and (
+                src.lines[after - 1].strip() == "" or src.lines[after - 1].lstrip().startswith("#")
+            ):
+                after += 1
+            if not (old_dict.lineno <= before <= old_dict.end_lineno and old_dict.lineno <= after <= old_dict.end_lineno):
+                return False
+            owner = (cls_names, target_name, old_dict)
+
+        cls_names, target_name, _ = owner
+        diff = self._diff_dict_table(path, src, new_src, cls_names, target_name, dict_cache)
+        if diff is None:
+            return False
+        kind, reach, changed_nodes, exp_quals = diff
+        if kind == "noop":
+            return True
+
         part = Result()
         self._one_change(path, src, new_src, ch, part)
         if part.fallback:
             return False
-        key_txt = ast.unparse(k_old)
-        res.tests |= part.tests & reach
-        res.notes.append(f"entry {key_txt}: {len(part.tests & reach)} of {len(part.tests)}")
+        key_txt = ",".join(ast.unparse(k) for k in changed_nodes[:3])
+        if len(changed_nodes) > 3:
+            key_txt += f"+{len(changed_nodes) - 3}"
+        narrowed = part.tests & reach
+        res.tests |= narrowed
+        res.notes.append(f"entry {key_txt}: {len(narrowed)} of {len(part.tests)}")
         res.if_import_changed |= part.if_import_changed
         res.allowed += part.allowed
         res.import_paths |= part.import_paths
-        res.has_non_stmt = True
-        exp_quals = set()
-        all_exp = True
-        for k in (k_old, k_new):
-            if isinstance(k, ast.Attribute) and isinstance(k.value, ast.Name) and k.value.id == "exp":
-                ename = k.attr
-                for qual in self.cov.classes:
-                    if qual.startswith("sqlglot.expressions.") and qual.rsplit(".", 1)[-1] == ename:
-                        exp_quals.add(qual)
-            else:
-                all_exp = False
-        if all_exp and exp_quals and part.class_quals and not part.has_non_class:
+        for p, lns in part.stmt_lines.items():
+            res.stmt_lines.setdefault(p, set()).update(lns)
+        for p, lns in part.import_stmt_lines.items():
+            res.import_stmt_lines.setdefault(p, set()).update(lns)
+        res.has_non_stmt = res.has_non_stmt or part.has_non_stmt
+        if exp_quals and part.class_quals and not part.has_non_class:
             for cq in part.class_quals:
                 res.class_class_pairs.append((cq, exp_quals))
             res.class_line_pairs.extend(part.class_line_pairs)

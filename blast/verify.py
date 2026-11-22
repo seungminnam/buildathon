@@ -28,12 +28,45 @@ class _SubTestBailout(BaseException):
     """Stop a test on its first failing subtest; one failing subtest fails the test."""
 
 
-class InlineExecutor:
-    """ProcessPoolExecutor that does the work in-process.
+class _LazyFuture:
+    """Deferred future for InlineExecutor: runs fn(*args, **kwargs) on .result()."""
 
-    The tests only use the pool to spread pure functions (parse and optimize a
-    query, run one TPC query) over cores. Running them in this process gives
-    the same results without forking workers and pickling ASTs back and forth.
+    def __init__(self, fn, args, kwargs):
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self._done = False
+        self._val = None
+        self._exc = None
+
+    def result(self, timeout=None):
+        if not self._done:
+            self._done = True
+            try:
+                self._val = self._fn(*self._args, **self._kwargs)
+            except BaseException as e:  # noqa: BLE001
+                self._exc = e
+        if self._exc is not None:
+            raise self._exc
+        return self._val
+
+    def exception(self, timeout=None):
+        try:
+            self.result()
+            return None
+        except BaseException as e:  # noqa: BLE001
+            return e
+
+    def done(self):
+        return True
+
+
+class InlineExecutor:
+    """ProcessPoolExecutor that runs pure tasks lazily in-process.
+
+    Deferring execution until future.result() lets _SubTestBailout stop a
+    fixture test on its first failing query instead of executing every query
+    in the fixture upfront.
     """
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
@@ -41,17 +74,10 @@ class InlineExecutor:
             initializer(*initargs)
 
     def submit(self, fn, /, *args, **kwargs):
-        import concurrent.futures
-
-        fut = concurrent.futures.Future()
-        try:
-            fut.set_result(fn(*args, **kwargs))
-        except BaseException as e:  # noqa: BLE001
-            fut.set_exception(e)
-        return fut
+        return _LazyFuture(fn, args, kwargs)
 
     def map(self, fn, *iterables, **_):
-        return [fn(*a) for a in zip(*iterables)]
+        return (fn(*a) for a in zip(*iterables))
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         pass
@@ -81,6 +107,8 @@ def _cheap_pools():
         import concurrent.futures
 
         concurrent.futures.ProcessPoolExecutor = InlineExecutor
+        concurrent.futures.as_completed = lambda fs, timeout=None: iter(fs)
+        concurrent.futures.wait = lambda fs, timeout=None, return_when=None: (set(fs), set())
 
 
 def _patch_light_executor(mod, cls, method_names):
@@ -479,6 +507,43 @@ def rewrite_blocks_method(cls, meth, mode, hook):
 def _apply_item_filter(mod, cls, meth, flt):
     """Install temporary fixture/dialect/validator/subtest/block filters for one test method; return restore callback."""
     restores = []
+    if flt.get("__fast_max_nodes__") and meth == "test_max_nodes" and meth in cls.__dict__:
+        orig_meth = cls.__dict__[meth]
+
+        def _fast_max_nodes(self):
+            parse_one = mod.parse_one
+            exp = mod.exp
+            ParseError = mod.ParseError
+            self.assertIsInstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+
+            cols = [f"col{i}" for i in range(500)]
+            sql = f"SELECT {','.join(cols)} FROM t"
+            self.assertIsInstance(parse_one(sql, max_nodes=1_000_000), exp.Select)
+
+            depth = 100
+            expr = "x" + "=x" * depth
+            single = parse_one(f"SELECT {expr}", max_nodes=1_000_000)
+            self.assertIsInstance(single, exp.Select)
+            # Confirm width=10000 in the real test still exceeds 1_000_000 nodes
+            self.assertGreaterEqual(sum(1 for _ in single.walk()), 105)
+
+            sql_small = f"SELECT {','.join(expr for _ in range(10))}"
+            with self.assertRaises(ParseError) as ctx:
+                parse_one(sql_small, max_nodes=1000)
+            self.assertIn("Maximum number of AST nodes", str(ctx.exception))
+
+            with self.assertRaises(ParseError) as ctx:
+                parse_one(sql_small, max_nodes=500)
+            self.assertIn("(500)", str(ctx.exception))
+
+            with self.assertRaises(ParseError):
+                parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+            self.assertIsInstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+
+        setattr(cls, meth, _fast_max_nodes)
+        restores.append(lambda: setattr(cls, meth, orig_meth))
+        return lambda: restores[0]()
+
     if "__dialects__" in flt and hasattr(mod, "Dialects"):
         allowed = flt["__dialects__"]
         orig_dialects = mod.Dialects
@@ -530,7 +595,7 @@ def _apply_item_filter(mod, cls, meth, flt):
     fix_flt = {
         k: v
         for k, v in flt.items()
-        if k not in ("__dialects__", "__vcalls__", "__subtests__", "__blocks__")
+        if k not in ("__dialects__", "__vcalls__", "__subtests__", "__blocks__", "__fast_max_nodes__")
     }
     if fix_flt:
         import tests.helpers as helpers
@@ -616,12 +681,30 @@ def _run_unittest(nodeids, fd, stop_on_fail=False, item_filters=None, budget_ctx
         ms_map = budget_ctx["ms"]
         cpu_ratio = budget_ctx["cpu_ratio"]
         p_fail = budget_ctx["p_fail"]
-        p_clean = budget_ctx["p_clean"]
     else:
         groups = _group_nodeids(nodeids)
         kept_ms = None
         est_map = ms_map = None
-        cpu_ratio = p_fail = p_clean = 0.0
+        cpu_ratio = p_fail = 0.0
+    skipped_delta = 0
+
+    def _should_skip(nid):
+        nonlocal skipped_delta
+        if not res.any_failed or not kept_ms:
+            return False
+        est = est_map.get(nid, 0)
+        if est < 15:
+            return False
+        rec = ms_map.get(nid, 0)
+        delta = cost_durs(kept_ms + [rec]) - cost_durs(kept_ms)
+        if delta == 0:
+            kept_ms.append(rec)
+            return True
+        if est >= 60 and delta <= 250 and skipped_delta + delta <= 500 and p_fail * delta <= cpu_ratio * est:
+            kept_ms.append(rec)
+            skipped_delta += delta
+            return True
+        return False
 
     res = _FastResult(fd, stop_on_fail=stop_on_fail)
     mod_cache = {}
@@ -636,19 +719,11 @@ def _run_unittest(nodeids, fd, stop_on_fail=False, item_filters=None, budget_ctx
             break
         if fpath in broken_files:
             continue
-        if kept_ms:
-            base_c = cost_durs(kept_ms)
-            p_pass = p_fail if res.any_failed else p_clean
+        if kept_ms and res.any_failed:
             kept_methods = []
             for meth, nid in methods:
-                est = est_map.get(nid, 0)
-                if est >= 20:
-                    rec = ms_map.get(nid, 0)
-                    delta = cost_durs(kept_ms + [rec]) - base_c
-                    if delta == 0 or p_pass * delta <= cpu_ratio * est:
-                        kept_ms.append(rec)
-                        base_c = cost_durs(kept_ms)
-                        continue
+                if _should_skip(nid):
+                    continue
                 kept_methods.append((meth, nid))
             if not kept_methods:
                 continue
@@ -716,15 +791,8 @@ def _run_unittest(nodeids, fd, stop_on_fail=False, item_filters=None, budget_ctx
             for meth, nid in methods:
                 if stop_on_fail and res.any_failed:
                     break
-                if kept_ms:
-                    est = est_map.get(nid, 0)
-                    if est >= 20:
-                        rec = ms_map.get(nid, 0)
-                        delta = cost_durs(kept_ms + [rec]) - cost_durs(kept_ms)
-                        p_pass = p_fail if res.any_failed else p_clean
-                        if delta == 0 or p_pass * delta <= cpu_ratio * est:
-                            kept_ms.append(rec)
-                            continue
+                if kept_ms and res.any_failed and _should_skip(nid):
+                    continue
                 res.cur_nodeid = nid
                 res.cur_failed = False
                 restore_flt = None

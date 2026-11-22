@@ -124,4 +124,23 @@ import 중에 도는 함수(파서 테이블을 만드는 함수 등)가 바뀌�
 - **전역 지연 캐시 가드:** `generator.py`의 `_build_dispatch`(`_DISPATCH_CACHE`)와 `dialect.py`의 `Dialect._try_load`는 프로세스당 한 번만 실행돼 단일 프로세스 커버리지에 첫 테스트만 기록된다. 이 구간이 수정되면 정적 분석(`blast/impact.py`)에서 전체 폴백하고 `subcov` 필터도 비활성화한다.
 - **`probe.fingerprint()` 메모이제이션:** `_canon()`에 객체 `id` 단위 캐시를 넣어 중복 순회를 없애고, `probe` 실행 전 `setuptools`/`doctest`를 부모에서 미리 워밍업해 probe CPU를 줄였다.
 
+## 23. amd64 임계치 보정과 LazyFuture 조기 종료
+
+v8(`c8cd459`, 서버 **140.7 s** = 시뮬 126.75 + CPU 13.96, miss 0)을 amd64 이미지로 `val` 117개에 돌려보니 arm64 대비 시뮬레이션 초과가 컸다. 원인은 세 가지였다.
+
+- **절대값 임계치:** `cheap`·`batch_cap`·`subset_mode` 임계치가 arm64 기준 고정 ms여서, CPU가 느린 환경에서는 `ACTUAL_MS`가 올라가며 배치 전체가 `listed`로 빠지거나 `subset_mode`로 잘렸다. 기록 시간(`ms[n]`, `listed`) 대비 무차원 비율로 바꿔 CPU 속도에 맞게 자동 조정되게 했다.
+- **`budget_ctx` 과다 스킵:** 첫 실패가 나기 전에도 스킵하거나 누적 스킵 시간이 커져 워커 비용이 늘어나는 경우가 있었다. 첫 실패 전에는 스킵하지 않고, 이후에도 0 ms 증가 또는 소폭 증가(`<= 250 ms`, 누적 `<= 500 ms`)만 허용하도록 고쳤다.
+- **실패 테스트의 선제 실행:** `TestOptimizer.check_file`은 `pool.submit()`으로 99~300개 쿼리를 전부 제출한 뒤 `wait()`·`as_completed()`로 검사한다. 기존 `InlineExecutor.submit()`은 제출 시점에 즉시 실행해서 1번 쿼리가 실패해도 나머지 299개를 다 돌고 있었다. `_LazyFuture`로 `.result()` 호출 시점에 지연 실행하고 `as_completed`/`wait`를 패치해 첫 실패 쿼리에서 바로 빠져나오게 바꾸자 `val` 검증 CPU가 3.5 s 줄었다.
+
+## 24. executor 코드에 30행 미니 테이블 쿼리 필터를 쓰면 안 된다
+
+`sqlglot/executor/*` 변경에도 TPC 다이제스트의 쿼리별 라인 커버리지(`q_lines`, 30행 미니 테이블 기준)를 적용해 보려다, `sqlglot/executor/env.py`의 `sql_not`을 깨는 테스트 케이스에서 miss가 나는 것을 확인했다. 30행 미니 테이블에서는 `sql_not`을 지나는 쿼리가 1개뿐이지만, 전체 CSV 테이블에서는 다른 쿼리도 해당 분기를 타기 때문이다. 따라서 `sqlglot/executor/` 변경은 기존대로 `tpc_applicable=False`를 유지하고 전체 테이블 커버리지(`coverage.json`)만 사용한다. 반면 파싱·최적화·플랜·코드 생성·DuckDB transpilation은 행 수와 무관하므로 비-executor 파일에 대한 `q_lines`와 `py_core_lines`는 안전하다.
+
+## 25. 딕셔너리 중복 키와 `test_no_redundant_expression_metadata`
+
+클래스/모듈 딕셔너리 항목 차분(`blast/impact.py`의 `dict_entry_change`)을 다중 줄·추가·삭제·`**DictComp`·모듈 수준 `EXPRESSION_METADATA`까지 확장하면서 두 가지 함정을 잡았다.
+
+- **중복 키:** `PostgresGenerator.TRANSFORMS`처럼 원본 sqlglot 코드에 같은 키(`exp.UnixToTime`)가 중복 선언된 딕셔너리가 있다. 키당 단일 값이 아니라 값 리스트로 그룹화해 비교해야 중복 키가 있는 테이블에서도 정상적으로 좁혀진다.
+- **메타데이터 전수 검사:** `tests/test_typing.py`의 `test_no_redundant_expression_metadata`는 `exp.*` 인스턴스를 만들지 않고 `sqlglot.typing.*.EXPRESSION_METADATA` 딕셔너리 전체를 순회한다. `EXPRESSION_METADATA` 변경 시에는 항상 `tests/test_typing.py`와 해당 파일을 연 테스트를 합집합으로 포함시켜 누락을 막았다.
+
 
