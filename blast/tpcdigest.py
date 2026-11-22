@@ -120,6 +120,7 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
     parse_err = None
     pickled = None
     parsed_sql = None
+    had_err = False
     try:
         parsed = parse_one(sql)
         pickled = pickle.loads(pickle.dumps(parsed))
@@ -129,6 +130,7 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
         parse_err = f"!{type(e).__name__}: {e}"
         pickled = None
         parsed_sql = parse_err
+        had_err = True
 
     duck_h = None
     if need_duck:
@@ -140,6 +142,7 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
                 d_parts.append(parsed.sql("duckdb") if parsed is not None else transpile(sql, write="duckdb")[0])
             except Exception as e:  # noqa: BLE001
                 d_parts.append(f"!{type(e).__name__}: {e}")
+                had_err = True
         duck_h = _h(*d_parts)
 
     opt_h = None
@@ -149,10 +152,12 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
             o_parts.append(parsed.sql("duckdb") if parsed is not None else transpile(sql, write="duckdb")[0])
         except Exception as e:  # noqa: BLE001
             o_parts.append(f"!{type(e).__name__}: {e}")
+            had_err = True
         try:
             o_parts.append(transpile(optimized, write="duckdb")[0])
         except Exception as e:  # noqa: BLE001
             o_parts.append(f"!{type(e).__name__}: {e}")
+            had_err = True
         opt_h = _h(*o_parts)
 
     py_h = None
@@ -166,6 +171,7 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
                     p_parts.append(repr(sorted(t.name for t in find_tables(pickled))))
                 except Exception as e:  # noqa: BLE001
                     p_parts.append(f"!{type(e).__name__}: {e}")
+                    had_err = True
                 plan = None
                 try:
                     expr = optimize(pickled, schema, leave_tables_isolated=True)
@@ -174,6 +180,7 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
                     p_parts.append(_plan_key(plan))
                 except Exception as e:  # noqa: BLE001
                     p_parts.append(f"!{type(e).__name__}: {e}")
+                    had_err = True
                 if plan is not None:
                     code_log.clear()
                     try:
@@ -183,12 +190,140 @@ def _digest_one_query(meta, sql, optimized, schema, tables_, need_duck, need_py,
                         p_parts.append(repr(sorted(map(repr, table.rows))))
                     except Exception as e:  # noqa: BLE001
                         p_parts.append(f"!{type(e).__name__}: {e}")
+                        had_err = True
                     p_parts.append(_IDS.sub("", repr(sorted(code_log))))
             else:
                 p_parts.append(parse_err)
         py_h = _h(*p_parts)
 
-    return duck_h, py_h, opt_h
+    return duck_h, py_h, opt_h, had_err
+
+
+MAX_REAL_VERIFY = 4
+
+
+class _RealVerifier:
+    """Lazily loads only the CSV tables needed by mismatching queries and runs
+    the exact TestExecutor DuckDB vs PythonExecutor assertion."""
+
+    def __init__(self, directory, schema, open_file):
+        self.directory = directory
+        self.schema = schema
+        self.open_file = open_file
+        self.conn = None
+        self.duck_views = set()
+        self.py_tables = {}
+        self.duck_cache = {}
+
+    def _ensure_conn(self):
+        if self.conn is None:
+            import duckdb
+
+            self.conn = duckdb.connect()
+
+    def _ensure_duck_table(self, table):
+        if table in self.duck_views:
+            return
+        self._ensure_conn()
+        columns = self.schema[table]
+        file_name = f"{self.directory}{table}.csv.gz"
+        self.conn.execute(
+            f"""
+            CREATE VIEW {table} AS
+            SELECT *
+            FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+            """
+        )
+        self.duck_views.add(table)
+
+    def _ensure_py_table(self, table):
+        if table in self.py_tables:
+            return self.py_tables[table]
+        import ast as pyast
+
+        from sqlglot.executor.table import Table
+
+        columns = self.schema[table]
+        file_name = f"{self.directory}{table}.csv.gz"
+        reader = csv.reader(self.open_file(file_name), delimiter="|")
+        next(reader)
+        rows, ctypes = [], []
+        for row in reader:
+            if not ctypes:
+                for v in row:
+                    try:
+                        ctypes.append(type(pyast.literal_eval(v)))
+                    except (ValueError, SyntaxError):
+                        ctypes.append(str)
+            rows.append(
+                tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
+            )
+        tbl = Table(columns=columns, rows=rows)
+        self.py_tables[table] = tbl
+        return tbl
+
+    def _duck_df(self, sql, tables_needed):
+        from sqlglot import transpile
+
+        for tbl in tables_needed:
+            self._ensure_duck_table(tbl)
+        if sql not in self.duck_cache:
+            self.duck_cache[sql] = self.conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+        return self.duck_cache[sql]
+
+    def verify_exec(self, meta, sql):
+        import numpy as np
+        import pandas as pd
+        from pandas.testing import assert_frame_equal
+
+        from sqlglot import find_tables, parse_one
+        from sqlglot.executor import execute
+
+        try:
+            expr = pickle.loads(pickle.dumps(parse_one(sql)))
+            if not meta.get("execute"):
+                return True
+            used = sorted({t.name for t in find_tables(expr)})
+            a = self._duck_df(sql, used)
+            tables = {name: self._ensure_py_table(name) for name in used}
+            table = execute(expr, schema=self.schema, tables=tables)
+            table = pickle.loads(pickle.dumps(table))
+            b = pd.DataFrame(
+                ((np.nan if c is None else c for c in r) for r in table.rows),
+                columns=table.columns,
+            )
+            assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+            return True
+        except BaseException:  # noqa: BLE001
+            return False
+
+    def verify_opt(self, sql, optimized):
+        from pandas.testing import assert_frame_equal
+
+        from sqlglot import find_tables, parse_one, transpile
+
+        try:
+            used_a = {t.name for t in find_tables(parse_one(sql))}
+            used_b = {t.name for t in find_tables(parse_one(optimized))}
+            for tbl in used_a | used_b:
+                self._ensure_duck_table(tbl)
+            a = self._duck_df(sql, used_a)
+            b = self.conn.execute(transpile(optimized, write="duckdb")[0]).fetchdf()
+            for i, column in enumerate(b.columns):
+                if "_col_" in column:
+                    b.rename(columns={column: a.columns[i]}, inplace=True)
+            assert_frame_equal(a, b)
+            return True
+        except BaseException:  # noqa: BLE001
+            return False
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.conn = None
 
 
 def _make_tracer(tree):
@@ -249,6 +384,16 @@ def _make_tracer(tree):
     return start, stop, close
 
 
+def _open_file(file_name):
+    with open(file_name, "rb") as f:
+        gzipped = f.read(2) == b"\x1f\x8b"
+    if gzipped:
+        import gzip
+
+        return gzip.open(file_name, "rt", newline="")
+    return open(file_name, encoding="utf-8", newline="")
+
+
 def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), query_filter=None, stages=None):
     """Build or compare TPC query digests.
 
@@ -256,7 +401,8 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
     hashes (`hashes`), per-stage files (`stage_files`), and per-query line
     coverage (`q_lines`).
     With `base`: returns {test_node_id: True/False}, stopping each test at its
-    first differing query.
+    first differing query (after checking up to MAX_REAL_VERIFY non-error
+    mismatches against the exact TestExecutor DuckDB/PythonExecutor comparison).
     `query_filter`: optional {suite_group ("tpch"/"tpcds"): set of query indices}
     `stages`: optional {suite_group: ("duck", "py")} restricting which stages run.
     """
@@ -266,7 +412,6 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
     from sqlglot.executor.table import ensure_tables
     from sqlglot.executor.python import PythonExecutor
     from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
-    import tests.test_executor as te
 
     schemas = {"TPCH_SCHEMA": TPCH_SCHEMA, "TPCDS_SCHEMA": TPCDS_SCHEMA}
     code_log = []
@@ -289,13 +434,13 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
         try:
             for grp, (schema_name, fixture, rel_dir) in SUITES_INFO.items():
                 schema = schemas[schema_name]
-                tables_ = ensure_tables(_mini_tables(FIXTURES_DIR + rel_dir, schema, te.open_file))
+                tables_ = ensure_tables(_mini_tables(FIXTURES_DIR + rel_dir, schema, _open_file))
                 exec_test = TEST_TPCH if grp == "tpch" else TEST_TPCDS
                 d_files, p_files = set(), set()
                 grp_lines = {}
                 for i, (meta, sql, optimized) in enumerate(load_sql_fixture_pairs(fixture)):
                     t_start()
-                    dh, _, oh = _digest_one_query(
+                    dh, _, oh, _ = _digest_one_query(
                         meta, sql, optimized, schema, tables_,
                         need_duck=True, need_py=False, need_opt=(grp == "tpch"), code_log=code_log,
                     )
@@ -303,7 +448,7 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
                     d_files.update(dl.keys())
 
                     t_start()
-                    _, ph, _ = _digest_one_query(
+                    _, ph, _, _ = _digest_one_query(
                         meta, sql, optimized, schema, tables_,
                         need_duck=False, need_py=True, need_opt=False, code_log=code_log,
                     )
@@ -351,43 +496,62 @@ def digest(tree, base=None, suites=("tpch_exec", "tpch_opt", "tpcds_exec"), quer
         need_duck = do_exec and ("duck" in allowed_stages)
         need_py = do_exec and ("py" in allowed_stages)
 
+        schema = schemas[schema_name]
         tables_ = None
         if need_py:
-            schema = schemas[schema_name]
-            tables_ = ensure_tables(_mini_tables(FIXTURES_DIR + rel_dir, schema, te.open_file))
-        else:
-            schema = schemas[schema_name]
+            tables_ = ensure_tables(_mini_tables(FIXTURES_DIR + rel_dir, schema, _open_file))
 
         q_subset = (query_filter or {}).get(grp)
         pairs = list(load_sql_fixture_pairs(fixture))
         exec_ok = do_exec and len(pairs) == len(ref_exec)
         opt_ok = do_opt and len(pairs) == len(ref_opt)
 
-        for i, (meta, sql, optimized) in enumerate(pairs):
-            if q_subset is not None and i not in q_subset:
-                continue
-            cur_duck = need_duck and exec_ok
-            cur_py = need_py and exec_ok
-            cur_opt = do_opt and opt_ok
-            if not (cur_duck or cur_py or cur_opt):
-                break
-            dh, ph, oh = _digest_one_query(
-                meta, sql, optimized, schema, tables_,
-                need_duck=cur_duck, need_py=cur_py, need_opt=cur_opt, code_log=code_log,
-            )
-            si = str(i)
-            if exec_ok:
-                ref_pair = ref_exec.get(si)
-                if ref_pair is None:
-                    exec_ok = False
-                else:
-                    if cur_duck and dh != ref_pair[0]:
-                        exec_ok = False
-                    if cur_py and ph != ref_pair[1]:
-                        exec_ok = False
-            if opt_ok and cur_opt:
-                if oh != ref_opt.get(si):
-                    opt_ok = False
+        verifier = None
+        real_exec_checks = 0
+        real_opt_checks = 0
+        try:
+            for i, (meta, sql, optimized) in enumerate(pairs):
+                if q_subset is not None and i not in q_subset:
+                    continue
+                cur_duck = need_duck and exec_ok
+                cur_py = need_py and exec_ok
+                cur_opt = do_opt and opt_ok
+                if not (cur_duck or cur_py or cur_opt):
+                    break
+                dh, ph, oh, had_err = _digest_one_query(
+                    meta, sql, optimized, schema, tables_,
+                    need_duck=cur_duck, need_py=cur_py, need_opt=cur_opt, code_log=code_log,
+                )
+                si = str(i)
+                if exec_ok:
+                    ref_pair = ref_exec.get(si)
+                    exec_mismatch = (
+                        ref_pair is None
+                        or (cur_duck and dh != ref_pair[0])
+                        or (cur_py and ph != ref_pair[1])
+                    )
+                    if exec_mismatch:
+                        if had_err or real_exec_checks >= MAX_REAL_VERIFY:
+                            exec_ok = False
+                        else:
+                            real_exec_checks += 1
+                            if verifier is None:
+                                verifier = _RealVerifier(FIXTURES_DIR + rel_dir, schema, _open_file)
+                            if not verifier.verify_exec(meta, sql):
+                                exec_ok = False
+                if opt_ok and cur_opt:
+                    if oh != ref_opt.get(si):
+                        if had_err or real_opt_checks >= MAX_REAL_VERIFY:
+                            opt_ok = False
+                        else:
+                            real_opt_checks += 1
+                            if verifier is None:
+                                verifier = _RealVerifier(FIXTURES_DIR + rel_dir, schema, _open_file)
+                            if not verifier.verify_opt(sql, optimized):
+                                opt_ok = False
+        finally:
+            if verifier is not None:
+                verifier.close()
 
         if do_exec:
             same[exec_test] = exec_ok

@@ -6,5 +6,6 @@
 maps/tpc_digest.json
 maps/probe_base.json
 maps/actual_ms.json
+maps/subcov.json
 !requirements.lock
 **/__pycache__

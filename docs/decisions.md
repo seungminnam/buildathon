@@ -2,6 +2,7 @@
 
 최신이 위. 형식: 날짜/시각 · 결정 · 이유 · 버린 대안.
 
+- 토 11/21 22:55 · `blast/subcov.py` 세부 항목 커버리지(SQL fixture·`__subtests__`·def-use `__blocks__`·dialect `__vcalls__`) + 2패스 slack-aware 검증 게이트 + `PROXY`를 `GIANT_TESTS`로 한정 + `probe.py` 메모이제이션 · 검증 CPU 대부분이 바뀐 줄을 안 지나는 서브케이스 반복 실행과 이미 확정된 워커 비용 아래의 저효율 테스트 실행에서 나와서, 테스트 내부 항목 단위로 좁히고 한계 이득이 없는 검증을 건너뛰어 검증 117개 시뮬레이션 395.1 s → 336.7 s, CPU 65.8 s → 38.2 s(miss 0)로 단축 · `test_optimize_in_nulls` DuckDB 생략(실측상 DuckDB 비중이 29%뿐이라 이득 대비 리스크 큼), `sole_followup` 시 게이트 우회(검증셋 CPU +4.6 s 역효과)
 - 토 11/21 18:15 · pytest 대신 직접 `unittest.TestCase` 러너 + 빌드 시점 실제 실행시간 보정(`blast/bench.py`) + 단계/쿼리 필터링 TPC 다이제스트 · sqlglot 테스트 1,620개 전부가 표준 unittest라서 pytest 기동비(700 ms → 32 ms)를 없애고, 실제 CPU 시간이 기록 시간보다 3~85배 짧은 테스트들을 정확히 골라 검증할 수 있음 · pytest 유지(CPU 병목), TPC 플랜 해시 생략(30행 미니 테이블만으로 전체 테이블 일치를 보장 못 해 miss 위험)
 - 토 11/21 14:50 · 정적 후보 중 짧은 테스트(1.5초 이하)만 컨테이너 안에서 실제로 돌려 보고, 통과하면 뺌. 통과할 확률 × 아끼는 비용이 CPU보다 클 때만 · 처음 보는 종류의 변경도 실제 실행이 잡아 줌 · 모든 후보 확인(CPU 16 s로 손해), 긴 테스트 확인(돌리는 비용이 넣는 비용과 같음)
 - 토 11/21 14:50 · tpcds를 쿼리 단위로 잘라 확인하는 건 보류 · sample에서 tpcds가 후보인데 안 깨지는 두 커밋 모두 실행되는 쿼리 57개 중 56~57개가 바뀐 줄을 지나서 자를 게 없음 · 쿼리별 coverage 맵(tools/covmap/trace_queries.py)

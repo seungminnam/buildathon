@@ -32,3 +32,21 @@ def pack(nums, ms):
         if best_cost is None or c < best_cost:
             best, best_cost = bins, c
     return [b for b in best if b]
+
+
+def cost_durs(durs):
+    """Minimum packed cost (ms) for a sequence of test durations in ms."""
+    if not durs:
+        return 0
+    ordered = sorted(durs, reverse=True)
+    n = len(ordered)
+    best = ordered[0] + WORKER_MS if n == 1 else sum(ordered) + WORKER_MS
+    for k in range(2, min(MAX_WORKERS, n) + 1):
+        loads = [0] * k
+        for d in ordered:
+            i = loads.index(min(loads))
+            loads[i] += d
+        c = max(loads) + WORKER_MS * k
+        if c < best:
+            best = c
+    return best

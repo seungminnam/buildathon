@@ -31,50 +31,115 @@ _NOISE = re.compile(r"(_abc_impl|_lock|_import_lock|:UNITTEST)$")
 _SKIP = (types.ModuleType, types.BuiltinFunctionType, property, staticmethod, classmethod)
 
 
-def _canon(v, depth=0, seen=None):
+_PRIMS = {bool, int, float, str, bytes, complex}
+
+
+def _canon(v, depth=0, seen=None, memo=None):
+    t = type(v)
+    if v is None or t in _PRIMS:
+        return repr(v)
+    vid = id(v)
+    if memo is not None:
+        m = memo.get(vid)
+        if m is not None:
+            return m
+    if isinstance(v, (bool, int, float, str, bytes, complex)):
+        r = repr(v)
+        if memo is not None:
+            memo[vid] = r
+        return r
     if depth > 40:
         return "<deep>"
-    if v is None or isinstance(v, (bool, int, float, str, bytes, complex)):
-        return repr(v)
+    if isinstance(v, type):
+        r = f"T:{v.__module__}.{v.__qualname__}"
+        if memo is not None:
+            memo[vid] = r
+        return r
+    if isinstance(v, _SKIP):
+        r = f"S:{t.__name__}"
+        if memo is not None:
+            memo[vid] = r
+        return r
     if seen is None:
         seen = set()
-    if id(v) in seen:
+    if vid in seen:
         return "<cycle>"
-    if isinstance(v, type):
-        return f"T:{v.__module__}.{v.__qualname__}"
-    if isinstance(v, types.FunctionType):
-        seen = seen | {id(v)}
-        cells = []
-        for c in v.__closure__ or ():
-            try:
-                cells.append(_canon(c.cell_contents, depth + 1, seen))
-            except ValueError:
-                cells.append("<empty>")
-        defaults = _canon(v.__defaults__, depth + 1, seen) if v.__closure__ else ""
-        return f"F:{v.__module__}.{v.__qualname__}({defaults})[{','.join(cells)}]"
-    if isinstance(v, functools.partial):
-        seen = seen | {id(v)}
-        return f"P:{_canon(v.func, depth + 1, seen)}{_canon(v.args, depth + 1, seen)}{_canon(v.keywords, depth + 1, seen)}"
-    if isinstance(v, types.MethodType):
-        return f"M:{_canon(v.__func__, depth + 1, seen)}"
-    if isinstance(v, _SKIP):
-        return f"S:{type(v).__name__}"
-    seen = seen | {id(v)}
-    if isinstance(v, dict):
-        items = sorted((_canon(k, depth + 1, seen), _canon(x, depth + 1, seen)) for k, x in v.items())
-        return "{" + ",".join(f"{k}:{x}" for k, x in items) + "}"
-    if isinstance(v, (list, tuple)):
-        return ("[" if isinstance(v, list) else "(") + ",".join(_canon(x, depth + 1, seen) for x in v) + "]"
-    if isinstance(v, (set, frozenset)):
-        return "s{" + ",".join(sorted(_canon(x, depth + 1, seen) for x in v)) + "}"
-    if hasattr(v, "__dict__") and not callable(v):
-        return f"O:{type(v).__qualname__}" + _canon(vars(v), depth + 1, seen)
-    return f"R:{type(v).__qualname__}:{v!r}"[:200]
+    if t is types.FunctionType or isinstance(v, types.FunctionType):
+        if not v.__closure__:
+            r = f"F:{v.__module__}.{v.__qualname__}()[]"
+            if memo is not None:
+                memo[vid] = r
+            return r
+        seen.add(vid)
+        try:
+            cells = []
+            for c in v.__closure__:
+                try:
+                    cells.append(_canon(c.cell_contents, depth + 1, seen, memo))
+                except ValueError:
+                    cells.append("<empty>")
+            defaults = _canon(v.__defaults__, depth + 1, seen, memo)
+            r = f"F:{v.__module__}.{v.__qualname__}({defaults})[{','.join(cells)}]"
+        finally:
+            seen.discard(vid)
+        if memo is not None and "<cycle>" not in r and "<deep>" not in r:
+            memo[vid] = r
+        return r
+    if t is functools.partial or isinstance(v, functools.partial):
+        seen.add(vid)
+        try:
+            r = (
+                f"P:{_canon(v.func, depth + 1, seen, memo)}"
+                f"{_canon(v.args, depth + 1, seen, memo)}"
+                f"{_canon(v.keywords, depth + 1, seen, memo)}"
+            )
+        finally:
+            seen.discard(vid)
+        if memo is not None and "<cycle>" not in r and "<deep>" not in r:
+            memo[vid] = r
+        return r
+    if t is types.MethodType or isinstance(v, types.MethodType):
+        return f"M:{_canon(v.__func__, depth + 1, seen, memo)}"
+    seen.add(vid)
+    try:
+        if t is dict or isinstance(v, dict):
+            if not v:
+                r = "{}"
+            else:
+                items = sorted(
+                    (_canon(k, depth + 1, seen, memo), _canon(x, depth + 1, seen, memo))
+                    for k, x in v.items()
+                )
+                r = "{" + ",".join(f"{k}:{x}" for k, x in items) + "}"
+        elif t is list or t is tuple or isinstance(v, (list, tuple)):
+            if not v:
+                r = "[]" if isinstance(v, list) else "(]"
+            else:
+                r = ("[" if isinstance(v, list) else "(") + ",".join(
+                    _canon(x, depth + 1, seen, memo) for x in v
+                ) + "]"
+        elif t is set or t is frozenset or isinstance(v, (set, frozenset)):
+            if not v:
+                r = "s{}"
+            else:
+                r = "s{" + ",".join(sorted(_canon(x, depth + 1, seen, memo) for x in v)) + "}"
+        elif hasattr(v, "__dict__") and not callable(v):
+            r = f"O:{t.__qualname__}" + _canon(vars(v), depth + 1, seen, memo)
+        else:
+            r = f"R:{t.__qualname__}:{v!r}"[:200]
+    finally:
+        seen.discard(vid)
+    if memo is not None and "<cycle>" not in r and "<deep>" not in r:
+        memo[vid] = r
+    return r
 
 
 def fingerprint():
     """{"module:Class.attr" or "module:name": sha1 of its canonical form}."""
     out = {}
+    memo = {}
+    seen = set()
+    sha1 = hashlib.sha1
     for modname, mod in list(sys.modules.items()):
         if not (modname == "sqlglot" or modname.startswith("sqlglot.")) or mod is None:
             continue
@@ -82,21 +147,30 @@ def fingerprint():
             if name.startswith("__"):
                 continue
             if isinstance(val, type) and val.__module__ == modname:
+                prefix = f"{modname}:{val.__qualname__}."
                 for attr, x in list(vars(val).items()):
                     if attr.startswith("__") and attr not in ("__slots__",):
                         continue
                     if isinstance(x, (types.FunctionType,) + _SKIP):
                         continue
-                    out[f"{modname}:{val.__qualname__}.{attr}"] = _canon(x)
+                    k = prefix + attr
+                    if _NOISE.search(k):
+                        continue
+                    v = _canon(x, 0, seen, memo)
+                    if " at 0x" in v:
+                        v = _ADDR.sub("", v)
+                    out[k] = sha1(v.encode("utf-8", "replace")).hexdigest()[:16]
             elif isinstance(val, (type, types.FunctionType, types.ModuleType)):
                 continue
             else:
-                out[f"{modname}:{name}"] = _canon(val)
-    return {
-        k: hashlib.sha1(_ADDR.sub("", v).encode("utf-8", "replace")).hexdigest()[:16]
-        for k, v in out.items()
-        if not _NOISE.search(k)
-    }
+                k = f"{modname}:{name}"
+                if _NOISE.search(k):
+                    continue
+                v = _canon(val, 0, seen, memo)
+                if " at 0x" in v:
+                    v = _ADDR.sub("", v)
+                out[k] = sha1(v.encode("utf-8", "replace")).hexdigest()[:16]
+    return out
 
 
 def load_everything(tree):

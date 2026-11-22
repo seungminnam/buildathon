@@ -56,3 +56,12 @@ sqlglot(파이썬 SQL 파서)에 대한 patch가 커밋마다 하나씩 주어�
 이건 추측이 들어간 판단이라 miss 위험이 있다. 긴 테스트만 잡아내는 변경이 오면 300 s를 문다. 그래서 검증 커밋 120개에서 "짧은 후보는 다 통과했는데 긴 테스트가 깨진" 경우가 몇 번인지 세고 나서 제출한다.
 
 sample: 시뮬레이션 158.9 → 108.7 s, 확인 CPU 약 15 s, miss 0.
+
+## v5~v8: 직접 unittest 러너, TPC 다이제스트, 항목 단위 sub-coverage
+
+- **직접 `unittest` 러너 (`blast/verify.py`) + 빌드 시점 시간 보정 (`blast/bench.py`):** pytest 기동비(700 ms → 32 ms)를 없애고, 실제 CPU 실행시간(`maps/actual_ms.json`) 기준으로 검증 대상을 고른다.
+- **TPC 다이제스트 (`blast/tpcdigest.py`):** 21.5 s짜리 `test_execute_tpcds` 등을 전체 실행하지 않고, 바뀐 줄이 닿는 쿼리·단계만 파싱/최적화/플랜/생성코드/30행 미니실행 해시를 기준값과 비교한다.
+- **항목 단위 sub-coverage (`blast/subcov.py`):** 빌드 시점에 229개 테스트의 SQL fixture 항목, `subTest` 블록, def-use 문장 블록, dialect `validate_*` 호출 줄별 커버리지를 모아 두고, 런타임에 바뀐 코드와 겹치는 항목만 실행한다.
+- **slack-aware 2패스 게이트:** 빠른 테스트(`<50 ms`)를 먼저 돌려 실패를 조기 탐지한 뒤, 이미 확정된 `kept` 테스트 집합 위에서 한계 절감액이 CPU 비용보다 큰 테스트만 이어서 실행한다.
+- **보수적 안전 가드:** `PROXY`는 `GIANT_TESTS`에만 허용하고, `_build_dispatch` / `Dialect._try_load` 같은 프로세스 전역 지연 캐시 구간 수정 시 전체 폴백한다.
+

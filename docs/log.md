@@ -4,7 +4,8 @@
 
 | 시각 (EST) | 누가 | 커밋 | 무엇을 바꿨나 | 로컬 점수 | 서버 점수 | 메모 |
 |---|---|---|---|---|---|---|
-| 토 18:15 | ryan | (v7) | pytest 대신 직접 unittest 러너 + InlineExecutor + 경량 TestExecutor + 빌드 시점 실제 실행시간 보정(`blast/bench.py`) + TPC 다이제스트 O(N) 플랜 키·단계/쿼리 필터·비실행 쿼리 처리 + `probe_base` 빌드 시점 선계산 + `gc.freeze()` + `tpc_check` 후 재검증 + 고효율 부분 검증 | sample **94.35 s** (정답 하한 일치) + CPU 11.3 s, 0 miss. 검증 117개 **395.12 s** (정답 303.4) + CPU 65.8 s, 0 miss | | v6 대비 검증 시뮬 -138 s, CPU -7.6 s |
+| 토 23:00 | ryan | (v8) | 항목 단위 sub-coverage(`blast/subcov.py`: 229개 테스트 SQL fixture·`__subtests__`·def-use `__blocks__`·dialect `__vcalls__` + 캐시된 Dialect 추적) + 2패스 slack-aware 검증 게이트 + `PROXY`를 `GIANT_TESTS`로 한정 + 단독 잔여 테스트 재검증 + `probe.py` 메모이제이션·사전 워밍업 + `impact.py` SQL fixture/AST/전역 지연 캐시 가드 | sample **94.35 s**(정답 일치) + CPU 8.7 s, 0 miss. 검증 117개 **336.66 s**(정답 303.4) + CPU 38.2 s, 0 miss. amd64 전체 147커밋 0 miss(빌드 97 s) | | v7 대비 검증 시뮬 -58.5 s, CPU -27.6 s (`Proxy_40` 164.3 → 132.1 s) |
+| 토 21:17 | ryan | f7708a3 | v7 제출 (직접 unittest 러너 + InlineExecutor + 경량 TestExecutor + `blast/bench.py` + TPC 다이제스트 O(N) 플랜 키·단계/쿼리 필터 + `probe_base` 선계산 + `gc.freeze()`) | sample **94.35 s**(정답 하한 일치) + CPU 11.3 s, 0 miss. 검증 117개 **395.12 s**(정답 303.4) + CPU 65.8 s, 0 miss | **164.2** (시뮬 135.0 + CPU 29.2, miss 0) | v4(203.1) 대비 -38.9 s, v6(208.3) 대비 -44.1 s |
 | 토 17:23 | ryan | 7f3e94a | v6 제출 | sample 108.69 s, 검증 117개 533.2 s | **208.3** (시뮬 151.6 + CPU 56.7, miss 0) | 시뮬은 -20.8 s 줄었지만 CPU가 +26.0 s 늘어 총점 악화 |
 | 토 17:10 | ryan | (v6) | import 에러가 난 모듈을 쓰는 테스트로만 좁힘, "수집 때 import"라는 이유의 전체 폴백을 probe로 확인, 클래스 테이블 한 항목 수정은 그 항목을 쓰는 테스트로 좁힘 | sample 108.69 s, 0 miss. 검증 117개 0 miss, 533.2 s (정답 303.4) | | |
 | 토 17:10 | ryan | (v5) | TPC 다이제스트: tpcds/tpch 쿼리마다 파싱·최적화·플랜·생성 코드·작은 테이블 실행 결과를 원본과 비교해서 같으면 긴 TPC 테스트를 뺌. 원본 값은 빌드 때 만듦 | sample 112.05 s, 0 miss. 검증 110개 0 miss, 545 s (정답 291) | | amd64 이미지에서 빌드 때 값과 실행 때 값이 일치하는 것 확인 |

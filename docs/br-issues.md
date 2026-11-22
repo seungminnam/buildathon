@@ -103,3 +103,25 @@ import 중에 도는 함수(파서 테이블을 만드는 함수 등)가 바뀌�
 - `sqlglot/expressions/core.py`의 `UNITTEST = "unittest" in sys.modules` 값이 빌드 때와 런타임에 달라서 잡음으로 잡히던 문제를 `_NOISE` 패턴에 추가해 고쳤다.
 - 최상위 함수의 기본 인자만 바뀐 경우(`bv070082`, `simplify`)는 클로저가 아니므로 `RULES` 리스트 지문 비교에서 제외해 전체 폴백을 막았다.
 
+## 20. PROXY가 일반 테스트까지 대신 빼다가 miss가 났다
+
+`bv070082`에서 `PROXY` 로직이 일반 장시간 테스트(`test_tpcds`, 2.2 s)까지 "짧은 후보들이 다 통과했으니 빼자"며 생략해 miss가 났다. `test_tpcds`만 깨지는 변경이었기 때문이다. `VOUCHABLE`은 진짜 거대 테스트(`GIANT_TESTS`: `test_max_nodes`, `test_execute_tpcds`, `test_execute_tpch`, `test_optimized_tpch`)로만 제한하고, TPC 다이제스트를 쓸 수 있는 커밋에서는 TPC 테스트를 PROXY로 빼지 않도록 막았다. 대신 거대 테스트가 아닌 후보 하나만 남았을 때는 실제 실행 시간이 짧으면(`<= 2.3 s`) 한 번 더 직접 돌려 확인한다.
+
+## 21. 긴 단위 테스트의 부분 실행 (per-item sub-coverage)
+
+검증 CPU의 대부분은 100~200개 후보 테스트 전체를 돌리면서, 그 안의 수백~수천 개 SQL 케이스 중 바뀐 줄을 지나지 않는 케이스까지 전부 실행하는 데서 나왔다. 빌드 시점(`blast/subcov.py`, 4워커 fork, 약 23 s)에 229개 테스트의 세부 항목별 커버리지를 수집해 `maps/subcov.json`에 저장한다.
+
+- **SQL fixture / dialect 루프 (30개):** fixture 항목별·dialect별 커버리지.
+- **서브테스트 (`__subtests__`, 17개):** `with self.subTest(...)` 블록을 AST로 감싸 실행 항목별 커버리지 기록.
+- **독립 문장 블록 (`__blocks__`, 5개):** `test_scope`처럼 `subTest` 없이 긴 테스트는 def-use 분석으로 독립 문장 컴포넌트를 나누고 항목별 시간 가중치(`w`)까지 기록.
+- **dialect validator (`__vcalls__`, 177개):** `validate_identity`/`validate_all` 호출 줄별 커버리지.
+
+`Dialect.get_or_raise()`가 인스턴스를 캐시하기 때문에, `Tokenizer`/`Parser`/`Generator`의 `__init__`에서 `type(self.dialect)`도 같이 기록해야 캐시 이후 항목에서도 해당 `Dialect` 클래스가 누락되지 않는다.
+
+## 22. slack-aware 2패스 검증 게이트와 프로세스 전역 캐시 가드
+
+- **2패스 게이트:** 한 커밋에서 이미 실패한 테스트나 `dear` 테스트가 생기면, 이후 남은 테스트 하나를 통과시켜 아끼는 시뮬레이션 시간이 실제 실행 CPU보다 작아지는 경우가 많다. 빠른 테스트(`<50 ms`)를 먼저 돌려 실패 여부를 일찍 확인하고, 남은 느린 테스트는 한계 절감액(`p_pass * delta`)이 예상 CPU(`cpu_ratio * est`)를 넘지 않으면 건너뛰도록 했다(`blast/verify.py`).
+- **전역 지연 캐시 가드:** `generator.py`의 `_build_dispatch`(`_DISPATCH_CACHE`)와 `dialect.py`의 `Dialect._try_load`는 프로세스당 한 번만 실행돼 단일 프로세스 커버리지에 첫 테스트만 기록된다. 이 구간이 수정되면 정적 분석(`blast/impact.py`)에서 전체 폴백하고 `subcov` 필터도 비활성화한다.
+- **`probe.fingerprint()` 메모이제이션:** `_canon()`에 객체 `id` 단위 캐시를 넣어 중복 순회를 없애고, `probe` 실행 전 `setuptools`/`doctest`를 부모에서 미리 워밍업해 probe CPU를 줄였다.
+
+

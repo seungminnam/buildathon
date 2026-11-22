@@ -22,11 +22,13 @@ COPY maps /app/maps
 # build time and at run time.
 ENV PYTHONHASHSEED=0 SKIP_INTEGRATION=0
 # Precompute build-time maps on the target CPU: TPC query digests + per-query
-# coverage, baseline import fingerprint, and calibrated per-test runtimes.
+# coverage, baseline import fingerprint, calibrated per-test runtimes, and
+# per-item sub-coverage.
 RUN cd /app \
  && python -m blast.tpcdigest /opt/sqlglot /app/maps/tpc_digest.json \
  && python -m blast.probe /opt/sqlglot /app/maps/probe_base.json \
  && python -m blast.bench /opt/sqlglot /app/maps/coverage.json /app/maps/actual_ms.json \
+ && python -m blast.subcov /opt/sqlglot /app/maps/subcov.json /app/maps/actual_ms.json \
  && python -m compileall -q /app && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1

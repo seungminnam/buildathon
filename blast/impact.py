@@ -48,7 +48,12 @@ class Result:
         self.allowed = []
         self.import_paths = set()
         self.stmt_lines = {}
+        self.import_stmt_lines = {}
         self.has_non_stmt = False
+        self.class_quals = set()
+        self.class_line_pairs = []
+        self.class_class_pairs = []
+        self.has_non_class = False
 
     def add(self, tests, note):
         self.tests |= set(tests)
@@ -57,7 +62,85 @@ class Result:
     def everything(self, cov, note):
         self.fallback = True
         self.has_non_stmt = True
+        self.has_non_class = True
         self.add(cov.all, "ALL " + note)
+
+
+# --- SQL fixture parsing (matching tests/helpers.py) ------------------------------------
+
+_SQL_FIXTURE_LIST_FILES = {
+    "tests/fixtures/identity.sql",
+    "tests/fixtures/partial.sql",
+    "tests/fixtures/optimizer/qualify_columns__invalid.sql",
+}
+
+
+def _filter_sql_comments(text):
+    return "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+
+
+def parse_sql_fixtures(text):
+    """Replicate tests.helpers.load_sql_fixtures on raw text."""
+    out, lines = [], []
+    for line in _filter_sql_comments(text).splitlines():
+        lines.append(line)
+        if not line.startswith("#"):
+            out.append("\n".join(lines))
+            lines.clear()
+    return out
+
+
+def parse_sql_fixture_pairs(text):
+    """Replicate tests.helpers.load_sql_fixture_pairs on raw text; None on malformed meta."""
+    statements = _filter_sql_comments(text).split(";")
+    size = len(statements)
+    pairs = []
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql_raw = statements[i].strip()
+            meta = {}
+            sql_lines = sql_raw.split("\n")
+            j = 0
+            while j < len(sql_lines) and sql_lines[j].startswith("#"):
+                if ":" not in sql_lines[j]:
+                    return None
+                k, v = sql_lines[j].split(":", maxsplit=1)
+                meta[k.lstrip("#").strip()] = v.strip()
+                j += 1
+            sql = "\n".join(sql_lines[j:])
+            expected = statements[i + 1].strip()
+            pairs.append((meta, sql, expected))
+    return pairs
+
+
+def is_sql_fixture_pair_file(path):
+    return (
+        path == "tests/fixtures/pretty.sql"
+        or (path.startswith("tests/fixtures/optimizer/") and path.endswith(".sql") and path not in _SQL_FIXTURE_LIST_FILES)
+    )
+
+
+def tpc_sql_changed_indices(old_text, new_text):
+    """Return (exec_changed, opt_changed) index sets for a TPC fixture pair file.
+
+    Each value is a set of changed query indices, or None if the query count
+    changed or parsing failed (meaning all queries must be treated as changed).
+    """
+    a = parse_sql_fixture_pairs(old_text)
+    b = parse_sql_fixture_pairs(new_text)
+    if a is None or b is None or len(a) != len(b):
+        return None, None
+    exec_changed = set()
+    opt_changed = set()
+    for i, ((ma, sa, ea), (mb, sb, eb)) in enumerate(zip(a, b)):
+        ma_nt = {k: v for k, v in ma.items() if k != "title"}
+        mb_nt = {k: v for k, v in mb.items() if k != "title"}
+        if ma_nt != mb_nt or sa != sb:
+            exec_changed.add(i)
+            opt_changed.add(i)
+        elif ea != eb:
+            opt_changed.add(i)
+    return exec_changed, opt_changed
 
 
 def module_name(path):
@@ -81,27 +164,74 @@ def strip_docstrings(tree):
     return tree
 
 
-def same_behaviour(old, new):
-    """True when two sources parse to the same tree, docstrings aside."""
-    try:
-        a = ast.dump(strip_docstrings(ast.parse(old)))
-        b = ast.dump(strip_docstrings(ast.parse(new)))
-    except SyntaxError:
+_PASS_BODY = [ast.Pass()]
+
+
+def _drop_doc(body):
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:] or _PASS_BODY
+    return body
+
+
+def _same_ast(a, b, hint_line=None):
+    """Fast structural AST equality ignoring docstrings and source locations."""
+    if type(a) is not type(b):
         return False
+    if isinstance(a, ast.AST):
+        doc_owner = isinstance(a, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        for field in a._fields:
+            va = getattr(a, field)
+            vb = getattr(b, field)
+            if doc_owner and field == "body":
+                va = _drop_doc(va)
+                vb = _drop_doc(vb)
+                if hint_line is not None and len(va) == len(vb) and len(va) > 1:
+                    hi = None
+                    for idx, st in enumerate(va):
+                        end = getattr(st, "end_lineno", None) or getattr(st, "lineno", 0)
+                        if getattr(st, "lineno", 0) <= hint_line <= end:
+                            hi = idx
+                            break
+                    if hi is not None:
+                        if not _same_ast(va[hi], vb[hi], hint_line):
+                            return False
+                        for idx in range(len(va)):
+                            if idx != hi and not _same_ast(va[idx], vb[idx]):
+                                return False
+                        continue
+            if not _same_ast(va, vb):
+                return False
+        return True
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        for xa, xb in zip(a, b):
+            if not _same_ast(xa, xb):
+                return False
+        return True
     return a == b
 
 
+def same_behaviour(old, new):
+    """True when two sources parse to the same tree, docstrings aside."""
+    try:
+        return _same_ast(ast.parse(old), ast.parse(new))
+    except SyntaxError:
+        return False
+
+
 class PySource:
-    """Parsed source with parent links and per-line lookups."""
+    """Parsed source with per-line lookups."""
 
     def __init__(self, text):
         self.text = text
         self.lines = text.split("\n")
         self.tree = ast.parse(text)
-        self.parent = {}
-        for node in ast.walk(self.tree):
-            for child in ast.iter_child_nodes(node):
-                self.parent[child] = node
 
     def chain_at(self, line, col):
         """Nodes from the module down to the deepest one holding (line, col)."""
@@ -168,6 +298,7 @@ class Analyzer:
         self.all_paths = all_paths  # repo-relative files at the pinned commit
         self._src = {}
         self._text = {}
+        self._text_lower = {}
         self._py_files = None
 
     # --- sources ------------------------------------------------------------------------
@@ -181,6 +312,12 @@ class Analyzer:
             except (OSError, UnicodeDecodeError):
                 self._text[path] = None
         return self._text[path]
+
+    def text_lower(self, path):
+        if path not in self._text_lower:
+            t = self.text(path)
+            self._text_lower[path] = t.lower() if t is not None else None
+        return self._text_lower[path]
 
     def source(self, path):
         if path not in self._src:
@@ -254,25 +391,31 @@ class Analyzer:
             out |= tests
         return out
 
+    def refs_with_lines(self, name, files=None):
+        """Like refs(), also returning {path: set(lines)} of mentioning lines."""
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        tests, at_import, lines_map = set(), False, {}
+        for p in files or self.py_files():
+            t = self.text(p)
+            if not t or name not in t:
+                continue
+            hits = [i + 1 for i, line in enumerate(t.split("\n")) if name in line and pat.search(line)]
+            if not hits:
+                continue
+            lines_map[p] = set(hits)
+            tests |= self.cov.tests_for_lines(p, hits)
+            imp = self.cov.import_lines.get(p)
+            if imp and any(h in imp for h in hits):
+                at_import = True
+        return tests, at_import, lines_map
+
     def refs(self, name, files=None):
         """Tests that ran a function-body line mentioning identifier `name`.
 
         Returns (tests, ran_at_import) where ran_at_import says a mentioning
         line ran while modules were imported (so the name feeds import-time
         work such as a metaclass)."""
-        pat = re.compile(r"\b" + re.escape(name) + r"\b")
-        tests, at_import = set(), False
-        for p in files or self.py_files():
-            t = self.text(p)
-            if not t or name not in t:
-                continue
-            hits = [i + 1 for i, line in enumerate(t.split("\n")) if pat.search(line)]
-            if not hits:
-                continue
-            tests |= self.cov.tests_for_lines(p, hits)
-            imp = self.cov.import_lines.get(p)
-            if imp and any(h in imp for h in hits):
-                at_import = True
+        tests, at_import, _ = self.refs_with_lines(name, files)
         return tests, at_import
 
     def module_tests(self, path):
@@ -343,10 +486,12 @@ class Analyzer:
         path = new_path or old_path
         if fd.binary:
             res.has_non_stmt = True
+            res.has_non_class = True
             res.add(self.cov.opened(path), f"binary {path}")
             return
         if old_path is None:
             res.has_non_stmt = True
+            res.has_non_class = True
             self.new_file(fd, res)
             return
         old = self.text(old_path)
@@ -360,15 +505,37 @@ class Analyzer:
         if new_path and old_path != new_path:
             # rename: the old path disappears
             res.has_non_stmt = True
+            res.has_non_class = True
             res.add(self.cov.opened(old_path), f"renamed {old_path}")
         if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
             self.python(old_path, old, new, fd, res)
         else:
-            res.has_non_stmt = True
-            self.data_file(old_path, res)
+            self.data_file(old_path, old, new, res)
 
-    def data_file(self, path, res):
-        res.add(self.cov.opened(path), f"opened {path}")
+    def data_file(self, path, old, new, res):
+        if new is not None and path.endswith(".sql"):
+            if is_sql_fixture_pair_file(path):
+                a = parse_sql_fixture_pairs(old)
+                b = parse_sql_fixture_pairs(new)
+                if a is not None and b is not None and len(a) == len(b):
+                    same = all(
+                        sa == sb
+                        and ea == eb
+                        and {k: v for k, v in ma.items() if k != "title"}
+                        == {k: v for k, v in mb.items() if k != "title"}
+                        for (ma, sa, ea), (mb, sb, eb) in zip(a, b)
+                    )
+                    if same:
+                        res.notes.append(f"no-op {path}")
+                        return
+            elif path in _SQL_FIXTURE_LIST_FILES:
+                if parse_sql_fixtures(old) == parse_sql_fixtures(new):
+                    res.notes.append(f"no-op {path}")
+                    return
+        opened = self.cov.opened(path)
+        if not (path.startswith("tests/fixtures/") and "/tpc-" not in path):
+            res.has_non_stmt = True
+        res.add(opened, f"opened {path}")
 
     def new_file(self, fd, res):
         path = fd.new_path
@@ -385,10 +552,8 @@ class Analyzer:
     def python(self, path, old, new, fd, res):
         if new is None:
             res.has_non_stmt = True
+            res.has_non_class = True
             res.add(self.module_tests(path), f"deleted {path}")
-            return
-        if same_behaviour(old, new):
-            res.notes.append(f"no-op {path}")
             return
         src = self.source(path)
         if src is None:
@@ -398,9 +563,18 @@ class Analyzer:
             new_src = PySource(new)
         except SyntaxError:
             res.has_non_stmt = True
+            res.has_non_class = True
             res.add(self.module_tests(path), f"syntax error {path}")
             return
-        for ch in patchlib.changes(fd):
+        changes = list(patchlib.changes(fd))
+        hint_line = None
+        if changes:
+            c0 = changes[0]
+            hint_line = getattr(c0, "old_line", None) or getattr(c0, "after", None)
+        if _same_ast(src.tree, new_src.tree, hint_line):
+            res.notes.append(f"no-op {path}")
+            return
+        for ch in changes:
             self.one_change(path, src, new_src, ch, res)
 
     def one_change(self, path, src, new_src, ch, res):
@@ -461,29 +635,56 @@ class Analyzer:
         return None
 
     def tests_mentioning(self, text):
-        """Tests whose test class source, or a fixture they opened, contains `text`
-        (case-insensitive)."""
+        """Tests whose test method/class source, or a fixture they opened, contains
+        `text` (case-insensitive)."""
         needle = text.lower()
         out = set()
         for path in self.py_files():
             if not path.startswith("tests/"):
                 continue
-            t = self.text(path) or ""
-            if needle not in t.lower():
+            tl = self.text_lower(path)
+            if not tl or needle not in tl:
                 continue
             src = self.source(path)
             if src is None:
                 out |= self.cov.by_file.get(path, set())
                 continue
+            llines = tl.split("\n")
             hit_module_level = False
             for node in src.tree.body:
-                seg = "\n".join(src.lines[node.lineno - 1:node.end_lineno]).lower()
+                seg = "\n".join(llines[node.lineno - 1:node.end_lineno])
                 if needle not in seg:
                     continue
                 if isinstance(node, ast.ClassDef):
-                    for i, tid in enumerate(self.cov.tests):
-                        if tid.startswith(f"{path}::{node.name}::"):
-                            out.add(i)
+                    # Narrow to individual test_* methods unless needle appears in
+                    # class-body code or a non-test helper/setup method.
+                    hit_whole_class = False
+                    hit_methods = set()
+                    covered = set()
+                    for item in node.body:
+                        iseg = "\n".join(llines[item.lineno - 1:item.end_lineno])
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_"):
+                            covered.update(range(item.lineno, item.end_lineno + 1))
+                            if needle in iseg:
+                                hit_methods.add(item.name)
+                        elif needle in iseg:
+                            hit_whole_class = True
+                            break
+                    if not hit_whole_class:
+                        for ln in range(node.lineno, node.end_lineno + 1):
+                            if ln not in covered and needle in llines[ln - 1]:
+                                hit_whole_class = True
+                                break
+                    prefix = f"{path}::{node.name}::"
+                    if hit_whole_class:
+                        for i, tid in enumerate(self.cov.tests):
+                            if tid.startswith(prefix):
+                                out.add(i)
+                    else:
+                        wanted = {prefix + m for m in hit_methods}
+                        for i, tid in enumerate(self.cov.tests):
+                            if tid in wanted:
+                                out.add(i)
                 else:
                     hit_module_level = True
             if hit_module_level:
@@ -492,8 +693,8 @@ class Analyzer:
         for fpath, s in self.cov.opens.items():
             if fpath.startswith("dir:") or fpath.endswith(".py"):
                 continue
-            t = self.text(fpath)
-            if t and needle in t.lower():
+            tl = self.text_lower(fpath)
+            if tl and needle in tl:
                 out.update(self.cov.sets[s])
         return out
 
@@ -526,6 +727,25 @@ class Analyzer:
         res.allowed += part.allowed
         res.import_paths |= part.import_paths
         res.has_non_stmt = True
+        exp_quals = set()
+        all_exp = True
+        for k in (k_old, k_new):
+            if isinstance(k, ast.Attribute) and isinstance(k.value, ast.Name) and k.value.id == "exp":
+                ename = k.attr
+                for qual in self.cov.classes:
+                    if qual.startswith("sqlglot.expressions.") and qual.rsplit(".", 1)[-1] == ename:
+                        exp_quals.add(qual)
+            else:
+                all_exp = False
+        if all_exp and exp_quals and part.class_quals and not part.has_non_class:
+            for cq in part.class_quals:
+                res.class_class_pairs.append((cq, exp_quals))
+            res.class_line_pairs.extend(part.class_line_pairs)
+        else:
+            res.class_quals |= part.class_quals
+            res.class_line_pairs.extend(part.class_line_pairs)
+            res.class_class_pairs.extend(part.class_class_pairs)
+        res.has_non_class = res.has_non_class or part.has_non_class
         return True
 
     def _one_change(self, path, src, new_src, ch, res):
@@ -562,9 +782,14 @@ class Analyzer:
             for nl in ch.new_lines:
                 self.new_side(path, new_src, nl, res)
         for line, col in positions:
-            self.at_position(path, src, line, col, res, insertion=ch.kind == "ins")
+            self.at_position(path, src, new_src, line, col, res, insertion=ch.kind == "ins")
 
-    def at_position(self, path, src, line, col, res, insertion=False):
+    def at_position(self, path, src, new_src, line, col, res, insertion=False):
+        if (path == "sqlglot/generator.py" and (70 <= line <= 92 or 1003 <= line <= 1011)) or (
+            path == "sqlglot/dialects/dialect.py" and 230 <= line <= 310
+        ):
+            res.everything(self.cov, f"lazy cache {path}:{line}")
+            return
         chain = src.chain_at(line, max(col, 0))
         # innermost function whose body holds the position
         func_idx = None
@@ -579,7 +804,7 @@ class Analyzer:
         if func_idx is not None:
             self.in_function(path, src, chain, func_idx, line, res, insertion)
         else:
-            self.definition_level(path, src, chain, line, res)
+            self.definition_level(path, src, new_src, chain, line, res)
 
     def in_function(self, path, src, chain, func_idx, line, res, insertion):
         func = chain[func_idx]
@@ -598,22 +823,149 @@ class Analyzer:
         imp = self.cov.import_lines.get(path)
         fl = set(range(func.lineno, func.end_lineno + 1))
         if imp and fl & imp:
-            # the function runs while modules import (decorators, registries)
+            # the function runs while modules import (decorators, registries);
+            # keep its stmt_lines separately so if the import probe proves no
+            # import state changed, downstream query/subtest filters still apply.
             res.if_import_changed |= self.module_tests(path)
             res.notes.append(f"import-time function {path}:{line}")
-            res.has_non_stmt = True
+            res.import_stmt_lines.setdefault(path, set()).update(lines)
         else:
             res.stmt_lines.setdefault(path, set()).update(lines)
         res.add(tests, f"stmt {path}:{line}")
 
-    def definition_level(self, path, src, chain, line, res):
-        res.has_non_stmt = True
+    def _tok_core_info(self):
+        """Lazily map Tokenizer class attrs -> TokenizerCore read-site lines."""
+        key = ("tok_core_info",)
+        if key in self._src:
+            return self._src[key]
+        tok_map = {}
+        init_core_range = (0, 0)
+        src_tok = self.source("sqlglot/tokens.py")
+        if src_tok is not None:
+            for node in ast.walk(src_tok.tree):
+                if isinstance(node, ast.FunctionDef) and node.name == "_init_core":
+                    init_core_range = (node.lineno, node.end_lineno)
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "TokenizerCore":
+                            for kw in sub.keywords:
+                                attrs = [
+                                    a.attr
+                                    for a in ast.walk(kw.value)
+                                    if isinstance(a, ast.Attribute)
+                                    and isinstance(a.value, ast.Name)
+                                    and a.value.id == "self"
+                                ]
+                                if len(attrs) == 1:
+                                    tok_map[attrs[0]] = kw.arg
+        core_use_lines = {}
+        src_core = self.source("sqlglot/tokenizer_core.py")
+        if src_core is not None:
+            for node in ast.walk(src_core.tree):
+                if isinstance(node, ast.ClassDef) and node.name == "TokenizerCore":
+                    for item in node.body:
+                        if isinstance(item, ast.FunctionDef) and item.name != "__init__":
+                            aliases = {}
+                            for st in ast.walk(item):
+                                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                                    v = st.value
+                                    if isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) and v.value.id == "self":
+                                        aliases[st.targets[0].id] = (v.attr, st.lineno)
+                            alias_lines = {ln for _, ln in aliases.values()}
+                            for sub in ast.walk(item):
+                                if (
+                                    isinstance(sub, ast.Attribute)
+                                    and isinstance(sub.value, ast.Name)
+                                    and sub.value.id == "self"
+                                    and isinstance(sub.ctx, ast.Load)
+                                    and sub.lineno not in alias_lines
+                                ):
+                                    core_use_lines.setdefault(sub.attr, set()).add(sub.lineno)
+                                elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in aliases:
+                                    core_use_lines.setdefault(aliases[sub.id][0], set()).add(sub.lineno)
+        dialect_new_range = (0, 0)
+        src_dia = self.source("sqlglot/dialects/dialect.py")
+        if src_dia is not None:
+            for node in ast.walk(src_dia.tree):
+                if isinstance(node, ast.ClassDef) and node.name == "_Dialect":
+                    for item in node.body:
+                        if isinstance(item, ast.FunctionDef) and item.name == "__new__":
+                            dialect_new_range = (item.lineno, item.end_lineno)
+        info = (tok_map, init_core_range, core_use_lines, dialect_new_range)
+        self._src[key] = info
+        return info
+
+    @staticmethod
+    def _find_matching_func(new_src, classes, stmt):
+        """Find the unique FunctionDef with the same class path and name in new_src."""
+        container = new_src.tree
+        for c in classes:
+            matches = [n for n in container.body if isinstance(n, ast.ClassDef) and n.name == c.name]
+            if len(matches) != 1:
+                return None
+            container = matches[0]
+        fmatches = [
+            n
+            for n in container.body
+            if type(n) is type(stmt) and n.name == stmt.name
+        ]
+        return fmatches[0] if len(fmatches) == 1 else None
+
+    @staticmethod
+    def _is_default_only_sig_change(old_fn, new_fn):
+        """True when only default values or annotations changed on a def header."""
+        if new_fn is None or type(old_fn) is not type(new_fn):
+            return False
+        if ast.dump(ast.Module(body=old_fn.decorator_list, type_ignores=[])) != ast.dump(
+            ast.Module(body=new_fn.decorator_list, type_ignores=[])
+        ):
+            return False
+        oa, na = old_fn.args, new_fn.args
+        if [a.arg for a in oa.posonlyargs] != [a.arg for a in na.posonlyargs]:
+            return False
+        if [a.arg for a in oa.args] != [a.arg for a in na.args]:
+            return False
+        if (oa.vararg.arg if oa.vararg else None) != (na.vararg.arg if na.vararg else None):
+            return False
+        if [a.arg for a in oa.kwonlyargs] != [a.arg for a in na.kwonlyargs]:
+            return False
+        if (oa.kwarg.arg if oa.kwarg else None) != (na.kwarg.arg if na.kwarg else None):
+            return False
+        if len(oa.defaults) != len(na.defaults):
+            return False
+        if [d is None for d in oa.kw_defaults] != [d is None for d in na.kw_defaults]:
+            return False
+        return True
+
+    def definition_level(self, path, src, new_src, chain, line, res):
         classes = [n for n in chain if isinstance(n, ast.ClassDef)]
         stmts = [n for n in chain if isinstance(n, ast.stmt)]
         stmt = stmts[-1] if stmts else None
         if stmt is None:
+            res.has_non_stmt = True
+            res.has_non_class = True
             res.add(self.module_tests(path), f"module-level {path}:{line}")
             return
+
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            new_fn = self._find_matching_func(new_src, classes, stmt)
+            if self._is_default_only_sig_change(stmt, new_fn):
+                first_line = min([stmt.lineno] + [d.lineno for d in stmt.decorator_list])
+                b0 = stmt.body[0]
+                if (
+                    len(stmt.body) > 1
+                    and isinstance(b0, ast.Expr)
+                    and isinstance(b0.value, ast.Constant)
+                    and isinstance(b0.value.value, str)
+                ):
+                    b0 = stmt.body[1]
+                entry_lines = {first_line, stmt.lineno} | header_lines(b0)
+                body = {first_line, stmt.lineno} | set(range(stmt.body[0].lineno, stmt.end_lineno + 1))
+                res.import_stmt_lines.setdefault(path, set()).update(entry_lines)
+                res.if_import_changed |= self.module_tests(path)
+                res.add(self.cov.tests_for_lines(path, body), f"default {stmt.name}")
+                return
+
+        res.has_non_stmt = True
         # names this statement defines
         names = set()
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -632,16 +984,19 @@ class Analyzer:
             for a in stmt.names:
                 names.add((a.asname or a.name).split(".")[0])
         else:
+            res.has_non_class = True
             res.add(self.module_tests(path), f"module statement {type(stmt).__name__} {path}:{line}")
             return
 
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # signature, defaults or decorators: every caller of the function
+            res.has_non_class = True
             body = set(range(stmt.body[0].lineno, stmt.end_lineno + 1))
             res.add(self.cov.tests_for_lines(path, body), f"signature {stmt.name}")
 
         if isinstance(stmt, ast.ClassDef):
             # class header (bases, decorators, keywords): everyone using the class
+            res.has_non_class = True
             cls_chain = classes[: classes.index(stmt) + 1] if stmt in classes else classes + [stmt]
             qual = module_name(path) + "." + ".".join(c.name for c in cls_chain)
             res.add(self.users(path, cls_chain), f"class header {stmt.name}")
@@ -658,12 +1013,13 @@ class Analyzer:
             self.name_impact(path, name, cls_chain_for_names, exclude, res)
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             # a broken import fails the module's import
+            res.has_non_class = True
             res.if_import_changed |= self.module_tests(path)
             res.notes.append(f"import in {path}")
 
     def name_impact(self, path, name, cls_chain, exclude, res, depth=0):
         """Tests affected when the definition of `name` changes."""
-        tests, at_import = self.refs(name)
+        tests, at_import, ref_lines = self.refs_with_lines(name)
         if cls_chain:
             qual = module_name(path) + "." + ".".join(c.name for c in cls_chain)
             if qual in self.cov.import_classes:
@@ -672,13 +1028,50 @@ class Analyzer:
                 res.notes.append(f"{cls_chain[-1].name}.{name} built at import")
             users = self.users(path, cls_chain)
             if self.cov.instantiated(qual) is not None:
+                # Tokenizer attrs forwarded into TokenizerCore: use TokenizerCore's
+                # actual read sites instead of the import-time _init_core forwarding.
+                if cls_chain[-1].name == "Tokenizer":
+                    tok_map, init_rng, core_lines, dia_rng = self._tok_core_info()
+                    core_attr = tok_map.get(name)
+                    if core_attr and core_lines.get(core_attr):
+                        t_core = self.cov.tests_for_lines("sqlglot/tokenizer_core.py", core_lines[core_attr])
+                        t_other, other_imp, hit_dia_new = set(), False, False
+                        core_ref_lines = {"sqlglot/tokenizer_core.py": set(core_lines[core_attr])}
+                        for p, ln in self.mentions(name):
+                            if p == "sqlglot/tokens.py" and init_rng[0] <= ln <= init_rng[1]:
+                                continue
+                            if p == "sqlglot/dialects/dialect.py" and dia_rng[0] <= ln <= dia_rng[1]:
+                                hit_dia_new = True
+                                continue
+                            core_ref_lines.setdefault(p, set()).add(ln)
+                            t_other |= self.cov.tests_for_lines(p, {ln})
+                            imp = self.cov.import_lines.get(p)
+                            if imp and ln in imp:
+                                other_imp = True
+                        if not other_imp:
+                            if hit_dia_new:
+                                res.if_import_changed |= users
+                                res.allowed.append(f"{module_name(path)}:{'.'.join(c.name for c in cls_chain)}.{name}")
+                            if all(p.startswith("sqlglot/") for p in core_ref_lines):
+                                res.class_line_pairs.append((qual, core_ref_lines))
+                            else:
+                                res.class_quals.add(qual)
+                            res.add((t_core | t_other) & users, f"{cls_chain[-1].name}.{name} core&users")
+                            return
                 if at_import or not tests:
+                    res.class_quals.add(qual)
                     res.add(users, f"{cls_chain[-1].name}.{name} users")
                 else:
+                    if all(p.startswith("sqlglot/") for p in ref_lines):
+                        res.class_line_pairs.append((qual, ref_lines))
+                    else:
+                        res.class_quals.add(qual)
                     res.add(tests & users, f"{cls_chain[-1].name}.{name} refs&users")
             else:
+                res.has_non_class = True
                 res.add(users, f"{cls_chain[-1].name}.{name} class users")
             return
+        res.has_non_class = True
         res.add(tests, f"refs {name}")
         if at_import:
             res.add(self.module_tests(path), f"{name} used at import")
@@ -740,6 +1133,7 @@ class Analyzer:
         elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             return  # a new import changes nothing unless it fails; failures show up below
         else:
+            res.has_non_class = True
             res.add(self.module_tests(path), f"new module statement {path}:{nl}")
             return
         classes = [n for n in chain if isinstance(n, ast.ClassDef) and n is not stmt]
@@ -747,6 +1141,12 @@ class Analyzer:
             tests, _ = self.refs(name)
             if classes:
                 # a new class member may override an inherited one: the class's users
+                qual = module_name(path) + "." + ".".join(c.name for c in classes)
+                if self.cov.instantiated(qual) is not None:
+                    res.class_quals.add(qual)
+                else:
+                    res.has_non_class = True
                 res.add(self.users(path, classes), f"new {classes[-1].name}.{name}")
                 continue
+            res.has_non_class = True
             res.add(tests, f"new {name}")
