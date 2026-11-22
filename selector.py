@@ -709,6 +709,29 @@ def _mod_to_path(mod):
     return None
 
 
+MAX_NARROW_BREAKS = 3
+
+
+class _ProbeDone(Exception):
+    pass
+
+
+def touches_definitions(changes, notes):
+    """True when a sqlglot module changes outside function bodies."""
+    if not any(p.startswith("sqlglot/") and p.endswith(".py") for p in changes):
+        return False
+    return any(not n.startswith(("stmt ", "no-op ", "opened ", "probe cpu")) for n in notes)
+
+
+def new_module(mod, changes):
+    """The module is a file the patch adds (nothing imports it at the pin)."""
+    path = mod.replace(".", "/")
+    for cand in (path + ".py", path + "/__init__.py"):
+        if cand in changes and not os.path.exists(os.path.join(SQLGLOT, cand)):
+            return True
+    return False
+
+
 def import_breakage(got, analyzer, local_to_number):
     """Tests hit by modules that fail to import, or None when that is everyone."""
     out = set()
@@ -867,6 +890,12 @@ def main():
                 res.notes.append("import not checked")
             else:
                 pending_probe[cid] = (extra, res.allowed)
+        if cid not in pending_probe and VERIFY and changes is not None and touches_definitions(changes, res.notes):
+            # Safety net: an edit outside function bodies can break importing
+            # (a renamed function still named in a table, a required argument
+            # that import-time code does not pass). Only import errors matter
+            # here, so the fingerprint is not compared.
+            pending_probe[cid] = (set(), None)
 
         vouchable = set()
         fix_tests = set()
@@ -921,6 +950,7 @@ def main():
     for cid, chosen, changes, res, active_paths, patch_text, edited_lines in plans:
         notes = res.notes
         tree_holder = [None]
+        force_all = False
 
         def get_tree():
             if tree_holder[0] is None:
@@ -931,8 +961,27 @@ def main():
             if cid in pending_probe:
                 verify.warm_up_probe()
                 extra, allowed = pending_probe[cid]
+                errors_only = allowed is None
                 p0 = children_cpu()
                 try:
+                    if errors_only:
+                        got = probe.probe(get_tree())
+                        errs = None if got is None else [e for e in got["errors"] if not new_module(e[0], changes)]
+                        if errs is None or len(errs) > MAX_NARROW_BREAKS:
+                            force_all = True
+                        elif errs:
+                            broken = import_breakage({"errors": errs}, analyzer, local_to_number)
+                            if broken is None:
+                                force_all = True
+                            else:
+                                chosen = chosen | broken
+                                res.has_non_class = True
+                                notes = notes + [f"import breaks {len(errs)} modules: {len(broken)} tests"]
+                        else:
+                            notes = notes + ["imports ok"]
+                        if force_all:
+                            notes = notes + [f"import breaks {'?' if errs is None else len(errs)} modules: everything"]
+                        raise _ProbeDone
                     if base_fp is None:
                         a, b = probe.probe(SQLGLOT), probe.probe(SQLGLOT)
                         base_fp = {}
@@ -945,7 +994,16 @@ def main():
                     if got and not got["errors"] and base_fp:
                         new_fp = {k: v for k, v in got["fp"].items() if k not in base_noise}
                         changed = [k for k in probe.diff(base_fp, new_fp) if not any(k.startswith(a) for a in allowed)]
-                    broken = import_breakage(got, analyzer, local_to_number) if got and got["errors"] else None
+                    errs = [e for e in got["errors"] if not new_module(e[0], changes)] if got else []
+                    if got and len(errs) > MAX_NARROW_BREAKS:
+                        force_all = True
+                        notes = notes + [f"import breaks {len(errs)} modules: everything"]
+                        raise _ProbeDone
+                    broken = import_breakage({"errors": errs}, analyzer, local_to_number) if errs else None
+                    if got and errs and broken is None:
+                        force_all = True
+                        notes = notes + [f"import breaks {len(errs)} modules: everything"]
+                        raise _ProbeDone
                     if broken is not None:
                         chosen = chosen | broken
                         res.has_non_class = True
@@ -971,8 +1029,11 @@ def main():
                         for p, lns in res.import_stmt_lines.items():
                             res.stmt_lines.setdefault(p, set()).update(lns)
                         notes = notes + ["import unchanged"]
+                except _ProbeDone:
+                    pass
                 except Exception as e:  # unsure: keep them
                     chosen = chosen | extra
+                    force_all = force_all or allowed is None
                     res.has_non_class = True
                     if res.import_stmt_lines:
                         res.has_non_stmt = True
@@ -982,11 +1043,15 @@ def main():
                 res.has_non_stmt = True
                 res.has_non_class = True
 
+            if force_all:
+                # importing is broken for many modules: most tests fail, and
+                # no partial check can be trusted on a tree that does not load
+                chosen = set(ms)
             fast_mn = max_nodes_fast_ok(changes, active_paths, patch_text, edited_lines, res)
             keep, how, stopped_early = chosen, "listed", False
             pre_tpc_info = ""
             tpc_done = set()
-            if VERIFY and changes is not None and keep & set(TPC):
+            if VERIFY and not force_all and changes is not None and keep & set(TPC):
                 try:
                     keep, pre_tpc_info = tpc_check(
                         cid, keep, changes, ms, deadline, res, active_paths,
@@ -995,7 +1060,7 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     pre_tpc_info = f" digest failed {type(e).__name__}"
 
-            if VERIFY and changes is not None and keep:
+            if VERIFY and not force_all and changes is not None and keep:
                 try:
                     keep, how, stopped_early = check(
                         cid,
@@ -1015,7 +1080,7 @@ def main():
             if pre_tpc_info:
                 how = (how + pre_tpc_info) if how != "listed" else pre_tpc_info.lstrip()
 
-            if VERIFY and changes is not None and keep & set(TPC):
+            if VERIFY and not force_all and changes is not None and keep & set(TPC):
                 before_tpc = len(keep)
                 how_pre = how
                 try:
