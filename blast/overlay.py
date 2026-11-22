@@ -40,7 +40,7 @@ def build(src_root, dst_root, changes):
         if os.path.lexists(dst):
             os.unlink(dst)
         if text is not None:
-            with open(dst, "w", encoding="utf-8", newline="") as f:
+            with open(dst, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                 f.write(text)
     return dst_root
 

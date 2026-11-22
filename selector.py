@@ -43,6 +43,11 @@ SKIP_P_FAIL = float(os.environ.get("BLAST_SKIP_P_FAIL", "0.60"))
 SKIP_P_CLEAN = float(os.environ.get("BLAST_SKIP_P_CLEAN", "0.85"))
 PROXY = os.environ.get("BLAST_PROXY", "1") == "1"
 PROXY_MIN = int(os.environ.get("BLAST_PROXY_MIN", "3"))
+# a check whose child reports nothing for this long is hung (an edit that loops
+# forever): kill it and keep every candidate, as on any timeout
+STALL_S = float(os.environ.get("BLAST_STALL_S", "10"))
+# a full TPC digest takes ~5-8 s of CPU; a hung one used to wait out 45 s
+DIGEST_MAX_S = float(os.environ.get("BLAST_DIGEST_MAX_S", "20"))
 
 TEST_MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GIANT_TESTS = {
@@ -415,6 +420,7 @@ def check(
             stop_on_fail=stop_early,
             item_filters=item_filters,
             budget_ctx=budget_ctx,
+            stall=STALL_S,
         )
     finally:
         if own_tree:
@@ -683,7 +689,7 @@ def tpc_check(
     try:
         same = tpcdigest.run(
             tree,
-            timeout=min(45, left - 4),
+            timeout=min(DIGEST_MAX_S, left - 4),
             base=TPC_BASE,
             suites=tuple(suites_run),
             query_filter=query_filter or None,
@@ -789,6 +795,7 @@ def merge(res, part):
     res.tests |= part.tests
     res.notes += part.notes
     res.fallback = res.fallback or part.fallback
+    res.no_verify = res.no_verify or part.no_verify
     res.if_import_changed |= part.if_import_changed
     res.allowed += part.allowed
     res.import_paths |= part.import_paths
@@ -857,7 +864,7 @@ def main():
         changes = {}
         active_paths = set()
         edited_lines = {}
-        patch_text = path.read_text(errors="replace")
+        patch_text = path.read_text(encoding="utf-8", errors="surrogateescape")
         try:
             for fd in patchlib.parse(patch_text):
                 part = Result()
@@ -879,6 +886,8 @@ def main():
         except Exception as e:  # never crash on a strange patch: run everything
             log(f"{cid}: analysis failed ({type(e).__name__}: {e}); running all tests")
             res.everything(cov, "error")
+            changes = None
+        if res.no_verify:
             changes = None
         chosen = {local_to_number[i] for i in res.tests if local_to_number[i] is not None}
         extra = {local_to_number[i] for i in res.if_import_changed if local_to_number[i] is not None}
@@ -993,7 +1002,10 @@ def main():
                     changed = None
                     if got and not got["errors"] and base_fp:
                         new_fp = {k: v for k, v in got["fp"].items() if k not in base_noise}
-                        changed = [k for k in probe.diff(base_fp, new_fp) if not any(k.startswith(a) for a in allowed)]
+                        changed = [
+                            k for k in probe.diff(base_fp, new_fp)
+                            if not any(k.endswith(a[1:]) if a.startswith("*.") else k.startswith(a) for a in allowed)
+                        ]
                     errs = [e for e in got["errors"] if not new_module(e[0], changes)] if got else []
                     if got and len(errs) > MAX_NARROW_BREAKS:
                         force_all = True
