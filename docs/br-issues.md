@@ -144,3 +144,9 @@ v8(`c8cd459`, 서버 **140.7 s** = 시뮬 126.75 + CPU 13.96, miss 0)을 amd64 �
 - **메타데이터 전수 검사:** `tests/test_typing.py`의 `test_no_redundant_expression_metadata`는 `exp.*` 인스턴스를 만들지 않고 `sqlglot.typing.*.EXPRESSION_METADATA` 딕셔너리 전체를 순회한다. `EXPRESSION_METADATA` 변경 시에는 항상 `tests/test_typing.py`와 해당 파일을 연 테스트를 합집합으로 포함시켜 누락을 막았다.
 
 
+
+## 22. 인라인 풀이 직렬화 버그를 숨겼다
+
+검증용 라벨러를 다시 돌리다가 sample 3utz(`serde.py` 변경) 라벨이 공식 정답과 달랐다. 깨져야 할 optimizer/executor 테스트 24개가 통과로 나왔다. 실제 테스트는 `ProcessPoolExecutor`로 일을 넘길 때 식 트리를 pickle해서 보내고 결과를 pickle해서 받는다. 직렬화 코드가 바뀌면 바로 그 지점에서 깨진다. 그런데 CPU를 아끼려고 넣은 인라인 실행기는 같은 프로세스에서 함수를 바로 불러서 pickle을 건너뛰었다.
+
+같은 문제가 제출 코드의 확인 단계에도 있었다. 직렬화만 건드리는 변경이 오면 실제로는 깨지는 테스트를 "통과"로 보고 뺄 수 있다는 뜻이다. sample에서는 다른 테스트가 먼저 깨져서 운 좋게 걸리지 않았다. 인라인 실행기가 호출(함수, 인자)과 결과를 실제 풀처럼 pickle 왕복하도록 고쳤다. 고친 뒤 3utz 37개, 2jrq 8개 모두 공식 정답과 같다. 추가 CPU는 optimizer 테스트 164개 기준 2% 안팎이다.

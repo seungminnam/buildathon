@@ -28,6 +28,14 @@ class _SubTestBailout(BaseException):
     """Stop a test on its first failing subtest; one failing subtest fails the test."""
 
 
+def _roundtrip(obj):
+    if os.environ.get("BLAST_PICKLE", "1") != "1":
+        return obj
+    import pickle
+
+    return pickle.loads(pickle.dumps(obj))
+
+
 class _LazyFuture:
     """Deferred future for InlineExecutor: runs fn(*args, **kwargs) on .result()."""
 
@@ -43,7 +51,11 @@ class _LazyFuture:
         if not self._done:
             self._done = True
             try:
-                self._val = self._fn(*self._args, **self._kwargs)
+                # A real pool pickles the call out and the result back, and
+                # a patch to serialisation code (serde.py, __reduce__) only
+                # shows up there. Do the same round trip in process.
+                fn, args, kwargs = _roundtrip((self._fn, self._args, self._kwargs))
+                self._val = _roundtrip(fn(*args, **kwargs))
             except BaseException as e:  # noqa: BLE001
                 self._exc = e
         if self._exc is not None:
@@ -71,13 +83,13 @@ class InlineExecutor:
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
         if initializer is not None:
-            initializer(*initargs)
+            initializer(*_roundtrip(tuple(initargs)))
 
     def submit(self, fn, /, *args, **kwargs):
         return _LazyFuture(fn, args, kwargs)
 
     def map(self, fn, *iterables, **_):
-        return (fn(*a) for a in zip(*iterables))
+        return (_LazyFuture(fn, a, {}).result() for a in zip(*iterables))
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         pass

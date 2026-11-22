@@ -4,6 +4,10 @@
 
 | 시각 (EST) | 누가 | 커밋 | 무엇을 바꿨나 | 로컬 점수 | 서버 점수 | 메모 |
 |---|---|---|---|---|---|---|
+| 일 09:30 | ryan | (v9) | 인라인 풀이 pickle 왕복을 하도록 수정 (직렬화 변경을 놓치던 버그) | sample 0 miss, 검증 117개 0 miss | | 3utz 라벨 재현 확인 |
+| 일 08:51 | ryan | 2d9e2b4 | 직접 unittest 러너, 항목 단위 sub-coverage, 빌드 때 실행시간 보정 | sample 94.35 s(정답과 같음), 검증 117개 337.2 s, 0 miss | **140.3** (시뮬 126.8 + CPU 13.5, miss 0) | |
+| 일 00:48 | ryan | c8cd459 | 항목 단위 sub-coverage, 2단계 확인 | | 140.7 (시뮬 126.7 + CPU 14.0) | |
+| 토 17:23 | ryan | 7f3e94a | v6 제출 | | 208.3 (시뮬 151.6 + CPU 56.7) | CPU가 두 배로 뛰어 총점 악화 |
 | 일 02:25 | ryan | (v9) | `_fast_max_nodes` 경량 검증(20 ms) + CPU 예산 기반 TPC 실검증(`REAL_BUDGET_S`)·`py_core_lines` 기반 `dbg_sql` 단계 + `_LazyFuture` 지연 실행(`as_completed`/`wait` 패치) + `dict_entry_change` AST 딕셔너리 차분(중복 키·`**DictComp`·`EXPRESSION_METADATA`) + `probe_change_impact` 축소 + 무차원 amd64 검증 게이트·`budget_ctx` 보정 + 중복 `tpc_check` 제거 | arm64: sample **94.35 s**(정답 일치) + CPU 8.6 s, val 117개 **336.54 s** + CPU 42.4 s, 0 miss. amd64: sample **98.58 s**, val **343.90 s**(유효 116개 초과 +12.84 s, 빌드 122 s), 전체 147커밋 0 miss | | v8 amd64 대비 val 유효 초과 -16.0 s, arm64 val CPU -3.5 s, 스트레스 27건 0 miss |
 | 토 23:00 | ryan | c8cd459 | 항목 단위 sub-coverage(`blast/subcov.py`: 229개 테스트 SQL fixture·`__subtests__`·def-use `__blocks__`·dialect `__vcalls__` + 캐시된 Dialect 추적) + 2패스 slack-aware 검증 게이트 + `PROXY`를 `GIANT_TESTS`로 한정 + 단독 잔여 테스트 재검증 + `probe.py` 메모이제이션·사전 워밍업 + `impact.py` SQL fixture/AST/전역 지연 캐시 가드 | sample **94.35 s**(정답 일치) + CPU 8.7 s, 0 miss. 검증 117개 **336.66 s**(정답 303.4) + CPU 38.2 s, 0 miss. amd64 전체 147커밋 0 miss(빌드 97 s) | **140.7** (시뮬 126.75 + CPU 13.96, miss 0) | v7(164.2) 대비 -23.5 s (시뮬 -8.25 s, CPU -15.24 s) |
 | 토 21:17 | ryan | f7708a3 | v7 제출 (직접 unittest 러너 + InlineExecutor + 경량 TestExecutor + `blast/bench.py` + TPC 다이제스트 O(N) 플랜 키·단계/쿼리 필터 + `probe_base` 선계산 + `gc.freeze()`) | sample **94.35 s**(정답 하한 일치) + CPU 11.3 s, 0 miss. 검증 117개 **395.12 s**(정답 303.4) + CPU 65.8 s, 0 miss | **164.2** (시뮬 135.0 + CPU 29.2, miss 0) | v4(203.1) 대비 -38.9 s, v6(208.3) 대비 -44.1 s |
